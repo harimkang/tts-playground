@@ -3,6 +3,12 @@ from dataclasses import dataclass
 import httpx
 
 from tts_playground.common.errors import ServiceError
+from tts_playground.common.logging import (
+    MAX_AUDIO_DURATION_SECONDS,
+    MAX_TIMING_MILLISECONDS,
+    normalize_bounded_nonnegative,
+    normalize_error_code,
+)
 from tts_playground.common.models import ModelID
 from tts_playground.common.settings import GatewaySettings
 from tts_playground.gateway.schemas import SpeechRequest
@@ -79,13 +85,23 @@ class BackendRouter:
 
         if not response.is_success:
             _raise_upstream_error(response)
+        _validate_wav_response(response)
 
         return AudioResult(
             content=response.content,
-            content_type=response.headers.get("content-type", "audio/wav"),
-            duration_seconds=response.headers.get("x-audio-duration"),
-            queue_ms=response.headers.get("x-queue-ms"),
-            processing_ms=response.headers.get("x-processing-ms"),
+            content_type="audio/wav",
+            duration_seconds=normalize_bounded_nonnegative(
+                response.headers.get("x-audio-duration"),
+                maximum=MAX_AUDIO_DURATION_SECONDS,
+            ),
+            queue_ms=normalize_bounded_nonnegative(
+                response.headers.get("x-queue-ms"),
+                maximum=MAX_TIMING_MILLISECONDS,
+            ),
+            processing_ms=normalize_bounded_nonnegative(
+                response.headers.get("x-processing-ms"),
+                maximum=MAX_TIMING_MILLISECONDS,
+            ),
         )
 
     async def _post_supertonic(
@@ -181,7 +197,7 @@ def _raise_upstream_error(response: httpx.Response) -> None:
             if isinstance(code, str) and isinstance(message, str):
                 raise ServiceError(
                     status_code=response.status_code,
-                    code=code,
+                    code=normalize_error_code(code) or "backend_error",
                     message=message,
                 )
 
@@ -189,4 +205,17 @@ def _raise_upstream_error(response: httpx.Response) -> None:
         status_code=response.status_code,
         code="backend_error",
         message="Backend request failed.",
+    )
+
+
+def _validate_wav_response(response: httpx.Response) -> None:
+    content_type = response.headers.get("content-type", "")
+    media_type = content_type.partition(";")[0].strip().lower()
+    content = response.content
+    if media_type == "audio/wav" and content[:4] == b"RIFF" and content[8:12] == b"WAVE":
+        return
+    raise ServiceError(
+        status_code=503,
+        code="backend_invalid_response",
+        message="Backend returned an invalid audio response.",
     )

@@ -10,7 +10,13 @@ from starlette.exceptions import HTTPException
 from starlette.responses import Response
 
 from tts_playground.common.errors import ServiceError
-from tts_playground.common.logging import configure_logging, log_gateway_request
+from tts_playground.common.logging import (
+    MAX_AUDIO_DURATION_SECONDS,
+    configure_logging,
+    log_gateway_request,
+    normalize_bounded_nonnegative,
+    normalize_error_code,
+)
 from tts_playground.common.models import ModelID
 from tts_playground.common.request_id import resolve_request_id
 from tts_playground.common.settings import GatewaySettings
@@ -111,6 +117,7 @@ def create_gateway_app(settings: GatewaySettings, backend_router: object | None)
                 )
             audio = await backend_router.synthesize(speech_request, request_id)
         except ServiceError as error:
+            telemetry_error_code = normalize_error_code(error.code) or "backend_error"
             metrics.record_request(
                 model=model,
                 status=error.status_code,
@@ -119,7 +126,7 @@ def create_gateway_app(settings: GatewaySettings, backend_router: object | None)
             )
             metrics.record_backend_error(
                 backend=_backend_name(speech_request.model),
-                code=error.code,
+                code=telemetry_error_code,
             )
             log_gateway_request(
                 request_id=request_id,
@@ -128,7 +135,7 @@ def create_gateway_app(settings: GatewaySettings, backend_router: object | None)
                 queue_ms=None,
                 processing_ms=None,
                 status=error.status_code,
-                error_code=error.code,
+                error_code=telemetry_error_code,
             )
             raise
 
@@ -184,15 +191,13 @@ def _backend_name(model: ModelID) -> str:
 
 
 def _parse_nonnegative_float(value: str | None) -> float | None:
-    if value is None:
+    normalized = normalize_bounded_nonnegative(
+        value,
+        maximum=MAX_AUDIO_DURATION_SECONDS,
+    )
+    if normalized is None:
         return None
-    try:
-        parsed = float(value)
-    except ValueError:
-        return None
-    if parsed < 0:
-        return None
-    return parsed
+    return float(normalized)
 
 
 def _copy_header(headers: dict[str, str], name: str, value: str | None) -> None:
