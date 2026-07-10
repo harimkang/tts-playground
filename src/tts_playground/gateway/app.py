@@ -4,6 +4,7 @@ from typing import Annotated
 from fastapi import Depends, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException
 from starlette.responses import Response
 
 from tts_playground.common.errors import ServiceError
@@ -49,6 +50,21 @@ def create_gateway_app(settings: GatewaySettings, backend_router: object | None)
             request_id=_request_id(request),
         )
 
+    @app.exception_handler(HTTPException)
+    async def http_error_handler(request: Request, error: HTTPException) -> JSONResponse:
+        if error.status_code == 404:
+            code, message = "not_found", "Resource not found."
+        elif error.status_code == 405:
+            code, message = "method_not_allowed", "Method not allowed."
+        else:
+            code, message = "http_error", "HTTP request failed."
+        return _error_response(
+            status_code=error.status_code,
+            code=code,
+            message=message,
+            request_id=_request_id(request),
+        )
+
     @app.get("/healthz")
     async def health() -> dict[str, str]:
         return {"status": "ok"}
@@ -58,13 +74,11 @@ def create_gateway_app(settings: GatewaySettings, backend_router: object | None)
         _speech_request: SpeechRequest,
         _authenticated: Annotated[None, Depends(authenticate)],
     ) -> Response:
-        if backend_router is None:
-            raise ServiceError(
-                status_code=503,
-                code="backend_not_configured",
-                message="Backend router is not configured.",
-            )
-        raise NotImplementedError("Backend routing is implemented in Task 3")
+        raise ServiceError(
+            status_code=503,
+            code="backend_not_configured",
+            message="Backend router is not configured.",
+        )
 
     return app
 

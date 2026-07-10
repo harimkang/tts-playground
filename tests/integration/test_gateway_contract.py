@@ -1,16 +1,29 @@
 import re
+import warnings
 from pathlib import Path
 
 import pytest
-from fastapi.testclient import TestClient
+from starlette.exceptions import StarletteDeprecationWarning
+
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore", StarletteDeprecationWarning)
+    from starlette.testclient import TestClient
 
 from tts_playground.common.settings import GatewaySettings
 from tts_playground.gateway.app import create_gateway_app
 
 
-def _create_client(key_file: Path) -> TestClient:
-    app = create_gateway_app(GatewaySettings(api_key_file=key_file), backend_router=None)
-    return TestClient(app)
+def _create_client(
+    key_file: Path,
+    backend_router: object | None = None,
+    *,
+    raise_server_exceptions: bool = True,
+) -> TestClient:
+    app = create_gateway_app(
+        GatewaySettings(api_key_file=key_file),
+        backend_router=backend_router,
+    )
+    return TestClient(app, raise_server_exceptions=raise_server_exceptions)
 
 
 def _speech_body() -> dict[str, object]:
@@ -26,12 +39,24 @@ def test_health_is_public_and_speech_requires_auth(tmp_path: Path) -> None:
     key = tmp_path / "key"
     key.write_text("secret-key\n")
     client = _create_client(key)
+    request_id = "req_unauthorized"
 
     assert client.get("/healthz").status_code == 200
-    response = client.post("/v1/audio/speech", json=_speech_body())
+    response = client.post(
+        "/v1/audio/speech",
+        headers={"X-Request-ID": request_id},
+        json=_speech_body(),
+    )
 
     assert response.status_code == 401
-    assert response.json()["error"]["code"] == "unauthorized"
+    assert response.headers["X-Request-ID"] == request_id
+    assert response.json() == {
+        "error": {
+            "code": "unauthorized",
+            "message": "Invalid or missing API key.",
+            "request_id": request_id,
+        }
+    }
 
 
 @pytest.mark.parametrize(
@@ -73,8 +98,77 @@ def test_authenticated_speech_reports_unconfigured_backend(tmp_path: Path) -> No
 
     assert response.status_code == 503
     assert response.headers["X-Request-ID"] == request_id
-    assert response.json()["error"]["code"] == "backend_not_configured"
-    assert response.json()["error"]["request_id"] == request_id
+    assert response.json() == {
+        "error": {
+            "code": "backend_not_configured",
+            "message": "Backend router is not configured.",
+            "request_id": request_id,
+        }
+    }
+
+
+def test_non_null_backend_is_controlled_until_routing_is_implemented(tmp_path: Path) -> None:
+    key = tmp_path / "key"
+    key.write_text("secret-key\n")
+    client = _create_client(key, object(), raise_server_exceptions=False)
+    request_id = "req_router-pending"
+
+    response = client.post(
+        "/v1/audio/speech",
+        headers={
+            "Authorization": "Bearer secret-key",
+            "X-Request-ID": request_id,
+        },
+        json=_speech_body(),
+    )
+
+    assert response.status_code == 503
+    assert response.headers["X-Request-ID"] == request_id
+    assert response.json() == {
+        "error": {
+            "code": "backend_not_configured",
+            "message": "Backend router is not configured.",
+            "request_id": request_id,
+        }
+    }
+
+
+def test_unknown_path_uses_public_error_envelope(tmp_path: Path) -> None:
+    key = tmp_path / "key"
+    key.write_text("secret-key\n")
+    client = _create_client(key)
+    request_id = "req_unknown-path"
+
+    response = client.get("/missing", headers={"X-Request-ID": request_id})
+
+    assert response.status_code == 404
+    assert response.headers["X-Request-ID"] == request_id
+    assert response.json() == {
+        "error": {
+            "code": "not_found",
+            "message": "Resource not found.",
+            "request_id": request_id,
+        }
+    }
+
+
+def test_wrong_method_uses_public_error_envelope(tmp_path: Path) -> None:
+    key = tmp_path / "key"
+    key.write_text("secret-key\n")
+    client = _create_client(key)
+    request_id = "req_wrong-method"
+
+    response = client.get("/v1/audio/speech", headers={"X-Request-ID": request_id})
+
+    assert response.status_code == 405
+    assert response.headers["X-Request-ID"] == request_id
+    assert response.json() == {
+        "error": {
+            "code": "method_not_allowed",
+            "message": "Method not allowed.",
+            "request_id": request_id,
+        }
+    }
 
 
 def test_validation_errors_use_public_envelope(tmp_path: Path) -> None:
