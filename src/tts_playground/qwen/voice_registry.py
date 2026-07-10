@@ -10,6 +10,7 @@ import threading
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from math import isfinite
 from pathlib import Path
 from typing import Final
 
@@ -21,6 +22,7 @@ MAX_AUDIO_BYTES: Final = 20 * 1024 * 1024
 MIN_AUDIO_SECONDS: Final = 3.0
 MAX_AUDIO_SECONDS: Final = 30.0
 _VOICE_ID_PATTERN: Final = re.compile(r"voice_[0-9a-f]{32}")
+_SUPPORTED_AUDIO_FORMATS: Final = frozenset({"FLAC", "WAV"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,9 +77,12 @@ class VoiceRegistry:
                 message="Reference audio exceeds the 20 MB limit.",
             )
 
+        audio_stream = io.BytesIO(audio)
         try:
+            audio_format = sf.info(audio_stream).format
+            audio_stream.seek(0)
             samples, sample_rate = sf.read(
-                io.BytesIO(audio),
+                audio_stream,
                 dtype="float32",
                 always_2d=True,
             )
@@ -87,6 +92,12 @@ class VoiceRegistry:
                 code="invalid_audio",
                 message="Reference audio is invalid.",
             ) from None
+        if audio_format not in _SUPPORTED_AUDIO_FORMATS:
+            raise ServiceError(
+                status_code=400,
+                code="invalid_audio",
+                message="Reference audio is invalid.",
+            )
 
         duration_seconds = len(samples) / sample_rate
         if not MIN_AUDIO_SECONDS <= duration_seconds <= MAX_AUDIO_SECONDS:
@@ -228,7 +239,12 @@ def _load_voice(voice_directory: Path) -> VoiceInternal | None:
         return None
     if isinstance(duration_seconds, bool) or not isinstance(duration_seconds, int | float):
         return None
-    if not isinstance(consent_confirmed, bool):
+    duration_seconds = float(duration_seconds)
+    if not isfinite(duration_seconds) or not (
+        MIN_AUDIO_SECONDS <= duration_seconds <= MAX_AUDIO_SECONDS
+    ):
+        return None
+    if consent_confirmed is not True:
         return None
     try:
         parsed_created_at = datetime.fromisoformat(created_at)
@@ -241,7 +257,7 @@ def _load_voice(voice_directory: Path) -> VoiceInternal | None:
         id=voice_id,
         name=name,
         language=language,
-        duration_seconds=float(duration_seconds),
+        duration_seconds=duration_seconds,
         consent_confirmed=consent_confirmed,
         created_at=created_at,
         transcript=transcript,
