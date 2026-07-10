@@ -2,10 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any
 
 from tts_playground.common.errors import ServiceError
 from tts_playground.common.models import QWEN_REPOSITORIES, ModelID
@@ -63,13 +62,15 @@ class QwenModelManager:
 
     async def synthesize(self, request: InternalSpeechRequest) -> SynthesisResult:
         async with self._gate.slot():
-            return await _finish_despite_cancellation(self._synthesize_locked(request))
+            checkpoint = _CancellationCheckpoint()
+            return await self._synthesize_locked(request, checkpoint)
 
     async def unload_if_idle(self) -> None:
         if not self._is_idle_unload_due():
             return
         async with self._gate.slot():
-            await _finish_despite_cancellation(self._unload_if_idle_locked())
+            checkpoint = _CancellationCheckpoint()
+            await self._unload_if_idle_locked(checkpoint)
 
     def invalidate_voice(self, voice_id: str) -> None:
         self._clone_prompts.pop(voice_id, None)
@@ -84,22 +85,28 @@ class QwenModelManager:
 
     async def shutdown(self) -> None:
         async with self._gate.slot():
-            await _finish_despite_cancellation(self._unload_model())
+            checkpoint = _CancellationCheckpoint()
+            await self._unload_model(checkpoint)
 
-    async def _synthesize_locked(self, request: InternalSpeechRequest) -> SynthesisResult:
+    async def _synthesize_locked(
+        self,
+        request: InternalSpeechRequest,
+        checkpoint: _CancellationCheckpoint,
+    ) -> SynthesisResult:
         self._recover_from_error_or_raise()
         for attempt in range(2):
             try:
-                model = await self._ensure_model(request.model)
-                clone_prompt = await self._clone_prompt(model, request)
-                result = await asyncio.to_thread(
+                model = await self._ensure_model(request.model, checkpoint)
+                self._touch_resident_model()
+                clone_prompt = await self._clone_prompt(model, request, checkpoint)
+                result = await checkpoint.run(
                     self._adapter.synthesize,
                     model,
                     request,
                     clone_prompt,
                 )
             except CudaOutOfMemory:
-                await self._unload_model()
+                await self._unload_model(checkpoint)
                 if attempt == 0:
                     continue
                 self._enter_error("cuda_out_of_memory")
@@ -108,16 +115,24 @@ class QwenModelManager:
                     code="cuda_out_of_memory",
                     message="Qwen ran out of GPU memory.",
                 ) from None
+            except asyncio.CancelledError:
+                self._touch_resident_model()
+                raise
+            except Exception:
+                self._touch_resident_model()
+                checkpoint.raise_if_requested()
+                raise
 
             self._last_used_at = self._monotonic()
             self._last_error_code = None
+            checkpoint.raise_if_requested()
             return result
 
         raise AssertionError("Qwen synthesis retry loop did not return or raise")
 
-    async def _unload_if_idle_locked(self) -> None:
+    async def _unload_if_idle_locked(self, checkpoint: _CancellationCheckpoint) -> None:
         if self._is_idle_unload_due():
-            await self._unload_model()
+            await self._unload_model(checkpoint)
 
     def _recover_from_error_or_raise(self) -> None:
         if self._state != WorkerState.ERROR:
@@ -135,27 +150,37 @@ class QwenModelManager:
         self._error_started_at = None
         self._last_error_code = None
 
-    async def _ensure_model(self, requested_model: ModelID) -> object:
+    async def _ensure_model(
+        self,
+        requested_model: ModelID,
+        checkpoint: _CancellationCheckpoint,
+    ) -> object:
         if self._model is not None and self._loaded_model == requested_model:
             return self._model
 
         if self._model is not None:
             self._state = WorkerState.SWITCHING
-            await self._unload_model()
+            await self._unload_model(checkpoint)
 
         self._state = WorkerState.LOADING
         try:
-            free_vram = await asyncio.to_thread(self._adapter.free_vram_bytes)
+            free_vram = await checkpoint.run(self._adapter.free_vram_bytes)
         except CudaOutOfMemory:
             self._state = WorkerState.UNLOADED
+            checkpoint.raise_if_requested()
             raise
         except Exception:
             self._enter_error("model_load_failed")
+            checkpoint.raise_if_requested()
             raise ServiceError(
                 status_code=503,
                 code="model_load_failed",
                 message="Qwen model could not be loaded.",
             ) from None
+
+        if checkpoint.requested:
+            self._state = WorkerState.UNLOADED
+            checkpoint.raise_if_requested()
 
         if free_vram < self._settings.min_free_vram_bytes:
             self._state = WorkerState.UNLOADED
@@ -168,16 +193,18 @@ class QwenModelManager:
 
         repository = QWEN_REPOSITORIES[requested_model]
         try:
-            model = await asyncio.to_thread(
+            model = await checkpoint.run(
                 self._adapter.load,
                 repository,
                 self._settings.attention_implementation,
             )
         except CudaOutOfMemory:
             self._state = WorkerState.UNLOADED
+            checkpoint.raise_if_requested()
             raise
         except Exception:
             self._enter_error("model_load_failed")
+            checkpoint.raise_if_requested()
             raise ServiceError(
                 status_code=503,
                 code="model_load_failed",
@@ -186,13 +213,16 @@ class QwenModelManager:
 
         self._model = model
         self._loaded_model = requested_model
+        self._last_used_at = self._monotonic()
         self._state = WorkerState.READY
+        checkpoint.raise_if_requested()
         return model
 
     async def _clone_prompt(
         self,
         model: object,
         request: InternalSpeechRequest,
+        checkpoint: _CancellationCheckpoint,
     ) -> object | None:
         if request.model != ModelID.QWEN_CLONE:
             return None
@@ -206,20 +236,25 @@ class QwenModelManager:
         if cached is not None:
             return cached
         voice = self._registry.get_internal(request.voice)
-        prompt = await asyncio.to_thread(
+        prompt = await checkpoint.run(
             self._adapter.build_clone_prompt,
             model,
             voice.audio_path,
             voice.transcript,
         )
         self._clone_prompts[request.voice] = prompt
+        checkpoint.raise_if_requested()
         return prompt
 
-    async def _unload_model(self) -> None:
+    async def _unload_model(self, checkpoint: _CancellationCheckpoint) -> None:
         model = self._model
         loaded_model = self._loaded_model
         if model is not None:
-            await asyncio.to_thread(self._adapter.unload, model)
+            try:
+                await checkpoint.run(self._adapter.unload, model)
+            except Exception:
+                checkpoint.raise_if_requested()
+                raise
         self._model = None
         self._loaded_model = None
         self._last_used_at = None
@@ -227,6 +262,7 @@ class QwenModelManager:
             self._clone_prompts.clear()
         if self._state != WorkerState.ERROR:
             self._state = WorkerState.UNLOADED
+        checkpoint.raise_if_requested()
 
     def _is_idle_unload_due(self) -> bool:
         return (
@@ -240,26 +276,31 @@ class QwenModelManager:
         self._error_started_at = self._monotonic()
         self._last_error_code = code
 
+    def _touch_resident_model(self) -> None:
+        if self._model is not None:
+            self._last_used_at = self._monotonic()
 
-async def _finish_despite_cancellation[ResultT](
-    operation: Coroutine[Any, Any, ResultT],
-) -> ResultT:
-    task = asyncio.create_task(operation)
-    cancellation_requested = False
-    while True:
-        try:
-            result = await asyncio.shield(task)
-        except asyncio.CancelledError:
-            if task.done():
-                if not task.cancelled():
-                    task.exception()
-                raise
-            cancellation_requested = True
-            continue
-        except BaseException:
-            if cancellation_requested:
-                raise asyncio.CancelledError from None
-            raise
-        if cancellation_requested:
+
+class _CancellationCheckpoint:
+    def __init__(self) -> None:
+        self.requested = False
+
+    async def run[ResultT, **Parameters](
+        self,
+        function: Callable[Parameters, ResultT],
+        /,
+        *args: Parameters.args,
+        **kwargs: Parameters.kwargs,
+    ) -> ResultT:
+        task = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+        while True:
+            try:
+                return await asyncio.shield(task)
+            except asyncio.CancelledError:
+                self.requested = True
+                if task.done():
+                    return task.result()
+
+    def raise_if_requested(self) -> None:
+        if self.requested:
             raise asyncio.CancelledError
-        return result

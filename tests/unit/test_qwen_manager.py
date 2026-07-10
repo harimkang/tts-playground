@@ -48,8 +48,12 @@ class FakeAdapter:
         self.load_calls: list[str] = []
         self.build_calls: list[str] = []
         self.synthesize_oom_failures = 0
+        self.synthesize_failures: list[BaseException] = []
         self.load_failures: list[BaseException] = []
         self.thread_calls: list[tuple[str, int]] = []
+        self.block_call: str | None = None
+        self.blocked_call_started = threading.Event()
+        self.release_blocked_call = threading.Event()
         self.block_synthesis = False
         self.first_synthesis_started = threading.Event()
         self.second_synthesis_started = threading.Event()
@@ -61,9 +65,17 @@ class FakeAdapter:
     def _record_thread(self, call: str) -> None:
         self.thread_calls.append((call, threading.get_ident()))
 
+    def _block_if_configured(self, call: str) -> None:
+        if self.block_call != call:
+            return
+        self.blocked_call_started.set()
+        if not self.release_blocked_call.wait(timeout=2.0):
+            raise AssertionError(f"test did not release blocked {call}")
+
     def free_vram_bytes(self) -> int:
         self._record_thread("free_vram_bytes")
         self.free_vram_calls += 1
+        self._block_if_configured("free_vram_bytes")
         return self.free_vram
 
     def load(self, repository: str, attention_implementation: str) -> object:
@@ -72,6 +84,7 @@ class FakeAdapter:
         name = _repository_name(repository)
         self.events.append(f"load:{name}")
         self.load_calls.append(repository)
+        self._block_if_configured("load")
         if self.load_failures:
             raise self.load_failures.pop(0)
         self._generation += 1
@@ -81,6 +94,7 @@ class FakeAdapter:
         self._record_thread("unload")
         assert isinstance(model, FakeModel)
         self.events.append(f"unload:{model.name}")
+        self._block_if_configured("unload")
 
     def build_clone_prompt(
         self,
@@ -95,6 +109,7 @@ class FakeAdapter:
         assert transcript == "test transcript"
         self.events.append(f"build:{voice_id}")
         self.build_calls.append(voice_id)
+        self._block_if_configured("build_clone_prompt")
         return (voice_id, model.generation)
 
     def synthesize(
@@ -106,6 +121,7 @@ class FakeAdapter:
         self._record_thread("synthesize")
         assert isinstance(model, FakeModel)
         self.events.append(f"synthesize:{model.name}")
+        self._block_if_configured("synthesize")
         if self.block_synthesis:
             with self._synthesis_lock:
                 self._synthesis_calls += 1
@@ -116,6 +132,8 @@ class FakeAdapter:
                 self.second_synthesis_started.set()
             if not self.release_synthesis.wait(timeout=2.0):
                 raise AssertionError("test did not release blocked synthesis")
+        if self.synthesize_failures:
+            raise self.synthesize_failures.pop(0)
         if self.synthesize_oom_failures:
             self.synthesize_oom_failures -= 1
             raise CudaOutOfMemory
@@ -374,6 +392,63 @@ async def test_unload_if_idle_unloads_only_after_configured_interval(
     assert (status.state, status.loaded_model) == (WorkerState.UNLOADED, None)
 
 
+async def test_invalid_clone_lookup_still_starts_resident_idle_timer(
+    manager: QwenModelManager,
+    fake_adapter: FakeAdapter,
+    clock: FakeClock,
+) -> None:
+    missing_voice = f"voice_{'0' * 32}"
+
+    with pytest.raises(ServiceError) as error:
+        await manager.synthesize(clone_request(missing_voice))
+
+    assert error.value.code == "voice_not_found"
+    assert manager.status().loaded_model == ModelID.QWEN_CLONE
+    clock.advance(600.0)
+    await manager.unload_if_idle()
+    assert fake_adapter.events == ["load:base", "unload:base"]
+
+
+async def test_non_oom_synthesis_failure_still_starts_resident_idle_timer(
+    manager: QwenModelManager,
+    fake_adapter: FakeAdapter,
+    clock: FakeClock,
+) -> None:
+    fake_adapter.synthesize_failures = [RuntimeError("generation failed")]
+
+    with pytest.raises(RuntimeError, match="generation failed"):
+        await manager.synthesize(custom_request())
+
+    assert manager.status().loaded_model == ModelID.QWEN_CUSTOM
+    clock.advance(600.0)
+    await manager.unload_if_idle()
+    assert fake_adapter.events == [
+        "load:custom",
+        "synthesize:custom",
+        "unload:custom",
+    ]
+
+
+async def test_failed_use_of_resident_model_resets_idle_timer(
+    manager: QwenModelManager,
+    fake_adapter: FakeAdapter,
+    clock: FakeClock,
+) -> None:
+    await manager.synthesize(custom_request())
+    clock.advance(500.0)
+    fake_adapter.synthesize_failures = [RuntimeError("generation failed")]
+    with pytest.raises(RuntimeError, match="generation failed"):
+        await manager.synthesize(custom_request())
+
+    clock.advance(599.0)
+    await manager.unload_if_idle()
+    assert fake_adapter.events[-1] == "synthesize:custom"
+
+    clock.advance(1.0)
+    await manager.unload_if_idle()
+    assert fake_adapter.events[-1] == "unload:custom"
+
+
 async def test_clone_prompts_are_per_voice_and_cleared_when_base_unloads(
     manager: QwenModelManager,
     fake_adapter: FakeAdapter,
@@ -446,3 +521,86 @@ async def test_cancelling_active_request_does_not_overlap_adapter_calls(
     assert not overlapped
     assert isinstance(results[0], asyncio.CancelledError)
     assert isinstance(results[1], SynthesisResult)
+
+
+async def test_cancellation_during_free_vram_check_stops_before_load(
+    manager: QwenModelManager,
+    fake_adapter: FakeAdapter,
+) -> None:
+    fake_adapter.block_call = "free_vram_bytes"
+    synthesis = asyncio.create_task(manager.synthesize(custom_request()))
+    assert await asyncio.to_thread(fake_adapter.blocked_call_started.wait, 1.0)
+
+    synthesis.cancel()
+    fake_adapter.release_blocked_call.set()
+    with pytest.raises(asyncio.CancelledError):
+        await synthesis
+
+    assert fake_adapter.load_calls == []
+    assert fake_adapter.events == []
+    assert manager.status().state == WorkerState.UNLOADED
+
+
+async def test_cancellation_during_load_preserves_model_and_stops_before_synthesis(
+    manager: QwenModelManager,
+    fake_adapter: FakeAdapter,
+    clock: FakeClock,
+) -> None:
+    fake_adapter.block_call = "load"
+    synthesis = asyncio.create_task(manager.synthesize(custom_request()))
+    assert await asyncio.to_thread(fake_adapter.blocked_call_started.wait, 1.0)
+
+    synthesis.cancel()
+    fake_adapter.release_blocked_call.set()
+    with pytest.raises(asyncio.CancelledError):
+        await synthesis
+
+    assert fake_adapter.events == ["load:custom"]
+    status = manager.status()
+    assert (status.state, status.loaded_model) == (WorkerState.READY, ModelID.QWEN_CUSTOM)
+
+    clock.advance(600.0)
+    await manager.unload_if_idle()
+    assert fake_adapter.events[-1] == "unload:custom"
+
+
+async def test_cancellation_during_clone_prompt_stops_before_synthesis(
+    manager: QwenModelManager,
+    fake_adapter: FakeAdapter,
+    registry: VoiceRegistry,
+) -> None:
+    voice_id = _register_voice(registry)
+    fake_adapter.block_call = "build_clone_prompt"
+    synthesis = asyncio.create_task(manager.synthesize(clone_request(voice_id)))
+    assert await asyncio.to_thread(fake_adapter.blocked_call_started.wait, 1.0)
+
+    synthesis.cancel()
+    fake_adapter.release_blocked_call.set()
+    with pytest.raises(asyncio.CancelledError):
+        await synthesis
+
+    assert fake_adapter.events == ["load:base", f"build:{voice_id}"]
+    assert fake_adapter.build_calls == [voice_id]
+    assert manager.status().loaded_model == ModelID.QWEN_CLONE
+
+
+async def test_cancellation_during_oom_cleanup_stops_before_retry(
+    manager: QwenModelManager,
+    fake_adapter: FakeAdapter,
+) -> None:
+    fake_adapter.synthesize_oom_failures = 1
+    fake_adapter.block_synthesis = True
+    synthesis = asyncio.create_task(manager.synthesize(custom_request()))
+    assert await asyncio.to_thread(fake_adapter.first_synthesis_started.wait, 1.0)
+
+    synthesis.cancel()
+    fake_adapter.release_synthesis.set()
+    with pytest.raises(asyncio.CancelledError):
+        await synthesis
+
+    assert fake_adapter.events == [
+        "load:custom",
+        "synthesize:custom",
+        "unload:custom",
+    ]
+    assert manager.status().state == WorkerState.UNLOADED
