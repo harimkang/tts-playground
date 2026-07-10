@@ -172,7 +172,6 @@ class QwenModelManager:
             free_vram = await checkpoint.run(self._adapter.free_vram_bytes)
         except CudaOutOfMemory:
             self._state = WorkerState.UNLOADED
-            checkpoint.raise_if_requested()
             raise
         except Exception:
             self._enter_error("model_load_failed")
@@ -205,7 +204,6 @@ class QwenModelManager:
             )
         except CudaOutOfMemory:
             self._state = WorkerState.UNLOADED
-            checkpoint.raise_if_requested()
             raise
         except Exception:
             self._enter_error("model_load_failed")

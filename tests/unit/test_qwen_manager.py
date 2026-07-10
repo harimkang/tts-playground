@@ -54,6 +54,9 @@ class FakeAdapter:
         self.block_call: str | None = None
         self.blocked_call_started = threading.Event()
         self.release_blocked_call = threading.Event()
+        self.block_load_call: int | None = None
+        self.blocked_load_started = threading.Event()
+        self.release_blocked_load = threading.Event()
         self.block_synthesis = False
         self.block_synthesis_call: int | None = None
         self.first_synthesis_started = threading.Event()
@@ -61,6 +64,7 @@ class FakeAdapter:
         self.release_synthesis = threading.Event()
         self._synthesis_calls = 0
         self._synthesis_lock = threading.Lock()
+        self._load_attempts = 0
         self._generation = 0
 
     def _record_thread(self, call: str) -> None:
@@ -86,6 +90,11 @@ class FakeAdapter:
         self.events.append(f"load:{name}")
         self.load_calls.append(repository)
         self._block_if_configured("load")
+        self._load_attempts += 1
+        if self.block_load_call == self._load_attempts:
+            self.blocked_load_started.set()
+            if not self.release_blocked_load.wait(timeout=2.0):
+                raise AssertionError("test did not release blocked load")
         if self.load_failures:
             raise self.load_failures.pop(0)
         self._generation += 1
@@ -629,6 +638,53 @@ async def test_cancellation_during_second_oom_commits_error_cooldown(
         "synthesize:custom",
         "unload:custom",
     ]
+    status = manager.status()
+    assert status.state == WorkerState.ERROR
+    assert status.loaded_model is None
+    assert status.last_error_code == "cuda_out_of_memory"
+
+    events_after_cancellation = list(fake_adapter.events)
+    with pytest.raises(ServiceError) as cooldown_error:
+        await manager.synthesize(custom_request())
+    assert cooldown_error.value.code == "model_unavailable"
+    assert fake_adapter.events == events_after_cancellation
+
+
+async def test_cancellation_during_first_load_oom_stops_before_retry(
+    manager: QwenModelManager,
+    fake_adapter: FakeAdapter,
+) -> None:
+    fake_adapter.load_failures = [CudaOutOfMemory()]
+    fake_adapter.block_load_call = 1
+    synthesis = asyncio.create_task(manager.synthesize(custom_request()))
+    assert await asyncio.to_thread(fake_adapter.blocked_load_started.wait, 1.0)
+
+    synthesis.cancel()
+    fake_adapter.release_blocked_load.set()
+    with pytest.raises(asyncio.CancelledError):
+        await synthesis
+
+    assert fake_adapter.events == ["load:custom"]
+    assert len(fake_adapter.load_calls) == 1
+    assert manager.status().state == WorkerState.UNLOADED
+
+
+async def test_cancellation_during_second_load_oom_commits_error_cooldown(
+    manager: QwenModelManager,
+    fake_adapter: FakeAdapter,
+) -> None:
+    fake_adapter.load_failures = [CudaOutOfMemory(), CudaOutOfMemory()]
+    fake_adapter.block_load_call = 2
+    synthesis = asyncio.create_task(manager.synthesize(custom_request()))
+    assert await asyncio.to_thread(fake_adapter.blocked_load_started.wait, 1.0)
+
+    synthesis.cancel()
+    fake_adapter.release_blocked_load.set()
+    with pytest.raises(asyncio.CancelledError):
+        await synthesis
+
+    assert fake_adapter.events == ["load:custom", "load:custom"]
+    assert len(fake_adapter.load_calls) == 2
     status = manager.status()
     assert status.state == WorkerState.ERROR
     assert status.loaded_model is None
