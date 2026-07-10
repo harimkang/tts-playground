@@ -1,0 +1,151 @@
+import re
+from pathlib import Path
+
+import pytest
+from fastapi.testclient import TestClient
+
+from tts_playground.common.settings import GatewaySettings
+from tts_playground.gateway.app import create_gateway_app
+
+
+def _create_client(key_file: Path) -> TestClient:
+    app = create_gateway_app(GatewaySettings(api_key_file=key_file), backend_router=None)
+    return TestClient(app)
+
+
+def _speech_body() -> dict[str, object]:
+    return {
+        "model": "supertonic-3",
+        "input": "test",
+        "voice": "F1",
+        "language": "en",
+    }
+
+
+def test_health_is_public_and_speech_requires_auth(tmp_path: Path) -> None:
+    key = tmp_path / "key"
+    key.write_text("secret-key\n")
+    client = _create_client(key)
+
+    assert client.get("/healthz").status_code == 200
+    response = client.post("/v1/audio/speech", json=_speech_body())
+
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "unauthorized"
+
+
+@pytest.mark.parametrize(
+    "authorization",
+    ["Basic secret-key", "Bearer", "Bearer wrong-key", "Bearer secret-key extra"],
+)
+def test_speech_rejects_invalid_authorization(
+    tmp_path: Path,
+    authorization: str,
+) -> None:
+    key = tmp_path / "key"
+    key.write_text("secret-key\n")
+    client = _create_client(key)
+
+    response = client.post(
+        "/v1/audio/speech",
+        headers={"Authorization": authorization},
+        json=_speech_body(),
+    )
+
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "unauthorized"
+
+
+def test_authenticated_speech_reports_unconfigured_backend(tmp_path: Path) -> None:
+    key = tmp_path / "key"
+    key.write_text("secret-key\n")
+    client = _create_client(key)
+    request_id = "req_0123456789abcdef"
+
+    response = client.post(
+        "/v1/audio/speech",
+        headers={
+            "Authorization": "Bearer secret-key",
+            "X-Request-ID": request_id,
+        },
+        json=_speech_body(),
+    )
+
+    assert response.status_code == 503
+    assert response.headers["X-Request-ID"] == request_id
+    assert response.json()["error"]["code"] == "backend_not_configured"
+    assert response.json()["error"]["request_id"] == request_id
+
+
+def test_validation_errors_use_public_envelope(tmp_path: Path) -> None:
+    key = tmp_path / "key"
+    key.write_text("secret-key\n")
+    client = _create_client(key)
+    request_id = "req_validation-id"
+
+    response = client.post(
+        "/v1/audio/speech",
+        headers={
+            "Authorization": "Bearer secret-key",
+            "X-Request-ID": request_id,
+        },
+        json={**_speech_body(), "voice": "invalid"},
+    )
+
+    assert response.status_code == 422
+    assert response.headers["X-Request-ID"] == request_id
+    assert response.json() == {
+        "error": {
+            "code": "validation_error",
+            "message": "Request validation failed.",
+            "request_id": request_id,
+        }
+    }
+
+
+def test_invalid_request_id_is_replaced_everywhere(tmp_path: Path) -> None:
+    key = tmp_path / "key"
+    key.write_text("secret-key\n")
+    client = _create_client(key)
+
+    response = client.post(
+        "/v1/audio/speech",
+        headers={
+            "Authorization": "Bearer secret-key",
+            "X-Request-ID": "not-a-request-id",
+        },
+        json=_speech_body(),
+    )
+
+    generated_request_id = response.headers["X-Request-ID"]
+    assert re.fullmatch(r"req_[0-9a-f]{32}", generated_request_id)
+    assert response.json()["error"]["request_id"] == generated_request_id
+
+
+def test_api_key_is_read_and_stripped_once_at_app_creation(tmp_path: Path) -> None:
+    key = tmp_path / "key"
+    key.write_text("  secret-key\n")
+    client = _create_client(key)
+    key.write_text("changed-key")
+
+    original_key_response = client.post(
+        "/v1/audio/speech",
+        headers={"Authorization": "Bearer secret-key"},
+        json=_speech_body(),
+    )
+    changed_key_response = client.post(
+        "/v1/audio/speech",
+        headers={"Authorization": "Bearer changed-key"},
+        json=_speech_body(),
+    )
+
+    assert original_key_response.status_code == 503
+    assert changed_key_response.status_code == 401
+
+
+def test_empty_api_key_file_is_rejected_at_app_creation(tmp_path: Path) -> None:
+    key = tmp_path / "key"
+    key.write_text(" \n")
+
+    with pytest.raises(ValueError, match="API key file must not be empty"):
+        create_gateway_app(GatewaySettings(api_key_file=key), backend_router=None)
