@@ -106,7 +106,12 @@ class QwenModelManager:
                     clone_prompt,
                 )
             except CudaOutOfMemory:
-                await self._unload_model(checkpoint)
+                try:
+                    await self._unload_model(checkpoint)
+                except asyncio.CancelledError:
+                    if attempt == 1:
+                        self._enter_error("cuda_out_of_memory")
+                    raise
                 if attempt == 0:
                     continue
                 self._enter_error("cuda_out_of_memory")
