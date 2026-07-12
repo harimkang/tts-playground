@@ -1,8 +1,10 @@
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from time import perf_counter
 from typing import Annotated, Protocol, runtime_checkable
 
-from fastapi import Depends, FastAPI, Request
+import httpx
+from fastapi import Depends, FastAPI, Header, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException
@@ -20,12 +22,19 @@ from tts_playground.common.models import ModelID
 from tts_playground.common.request_id import resolve_request_id
 from tts_playground.common.settings import GatewaySettings
 from tts_playground.gateway.auth import read_api_key, require_api_key
-from tts_playground.gateway.backends import AudioResult
+from tts_playground.gateway.backends import (
+    AudioResult,
+    BackendRouter,
+    DiscoveryResult,
+    ProxyResult,
+)
 from tts_playground.gateway.metrics import GatewayMetrics
 from tts_playground.gateway.routes import create_management_router
 from tts_playground.gateway.schemas import SpeechRequest
 
 RequestHandler = Callable[[Request], Awaitable[Response]]
+Authenticator = Callable[[str | None], None]
+AppLifespan = Callable[[FastAPI], AbstractAsyncContextManager[None]]
 
 
 @runtime_checkable
@@ -33,12 +42,18 @@ class SynthesisRouter(Protocol):
     async def synthesize(self, request: SpeechRequest, request_id: str) -> AudioResult: ...
 
 
-def create_gateway_app(settings: GatewaySettings, backend_router: object | None) -> FastAPI:
-    expected_api_key = read_api_key(settings.api_key_file)
-    authenticate = require_api_key(expected_api_key)
+def create_gateway_app(
+    settings: GatewaySettings,
+    backend_router: object | None,
+    *,
+    authenticate: Authenticator | None = None,
+    lifespan: AppLifespan | None = None,
+) -> FastAPI:
+    if authenticate is None:
+        authenticate = require_api_key(read_api_key(settings.api_key_file))
     configure_logging()
     metrics = GatewayMetrics.create()
-    app = FastAPI()
+    app = FastAPI(lifespan=lifespan)
     app.state.gateway_metrics = metrics
 
     @app.middleware("http")
@@ -157,6 +172,108 @@ def create_gateway_app(settings: GatewaySettings, backend_router: object | None)
     return app
 
 
+def create_runtime_gateway_app(settings: GatewaySettings | None = None) -> FastAPI:
+    runtime_settings = settings or GatewaySettings()
+    runtime_authenticate = _RuntimeAuthentication()
+    runtime_backend = _RuntimeBackendRouter()
+
+    @asynccontextmanager
+    async def lifespan(application: FastAPI) -> AsyncIterator[None]:
+        runtime_authenticate.attach(
+            require_api_key(read_api_key(runtime_settings.api_key_file))
+        )
+        try:
+            async with httpx.AsyncClient() as backend_client:
+                backend_router = BackendRouter(runtime_settings, backend_client)
+                runtime_backend.attach(backend_router)
+                application.state.backend_router = backend_router
+                try:
+                    yield
+                finally:
+                    application.state.backend_router = None
+                    runtime_backend.detach()
+        finally:
+            runtime_authenticate.detach()
+
+    return create_gateway_app(
+        runtime_settings,
+        runtime_backend,
+        authenticate=runtime_authenticate,
+        lifespan=lifespan,
+    )
+
+
+class _RuntimeAuthentication:
+    def __init__(self) -> None:
+        self._authenticate: Authenticator | None = None
+
+    def attach(self, authenticate: Authenticator) -> None:
+        self._authenticate = authenticate
+
+    def detach(self) -> None:
+        self._authenticate = None
+
+    def __call__(
+        self,
+        authorization: Annotated[str | None, Header(alias="Authorization")] = None,
+    ) -> None:
+        if self._authenticate is None:
+            raise RuntimeError("Gateway authentication is unavailable before startup")
+        self._authenticate(authorization)
+
+
+class _RuntimeBackendRouter:
+    def __init__(self) -> None:
+        self._backend: BackendRouter | None = None
+
+    def attach(self, backend: BackendRouter) -> None:
+        self._backend = backend
+
+    def detach(self) -> None:
+        self._backend = None
+
+    async def synthesize(self, request: SpeechRequest, request_id: str) -> AudioResult:
+        return await self._require_backend().synthesize(request, request_id)
+
+    async def discover(self, request_id: str) -> DiscoveryResult:
+        return await self._require_backend().discover(request_id)
+
+    async def register_voice(
+        self,
+        *,
+        content: AsyncIterator[bytes],
+        content_type: str | None,
+        content_length: int | None,
+        request_id: str,
+    ) -> ProxyResult:
+        return await self._require_backend().register_voice(
+            content=content,
+            content_type=content_type,
+            content_length=content_length,
+            request_id=request_id,
+        )
+
+    async def list_voices(self, request_id: str) -> ProxyResult:
+        return await self._require_backend().list_voices(request_id)
+
+    async def get_voice(self, voice_id: str, request_id: str) -> ProxyResult:
+        return await self._require_backend().get_voice(voice_id, request_id)
+
+    async def delete_voice(self, voice_id: str, request_id: str) -> ProxyResult:
+        return await self._require_backend().delete_voice(voice_id, request_id)
+
+    async def ready(self, request_id: str) -> None:
+        await self._require_backend().ready(request_id)
+
+    async def qwen_metrics(self, request_id: str) -> bytes | None:
+        return await self._require_backend().qwen_metrics(request_id)
+
+    def _require_backend(self) -> BackendRouter:
+        if self._backend is None:
+            raise RuntimeError("Gateway backend is unavailable before startup")
+        return self._backend
+
+
 def _request_id(request: Request) -> str:
     request_id = getattr(request.state, "request_id", None)
     if isinstance(request_id, str):
@@ -196,3 +313,6 @@ def _parse_nonnegative_float(value: str | None) -> float | None:
 def _copy_header(headers: dict[str, str], name: str, value: str | None) -> None:
     if value is not None:
         headers[name] = value
+
+
+app = create_runtime_gateway_app()

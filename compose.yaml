@@ -1,0 +1,158 @@
+services:
+  tts-gateway:
+    image: tts-gateway:latest
+    build:
+      context: .
+      dockerfile: docker/gateway.Dockerfile
+    command:
+      - uv
+      - run
+      - uvicorn
+      - tts_playground.gateway.app:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8020"
+    user: "${TTS_UID}:${TTS_GID}"
+    environment:
+      TTS_API_KEY_FILE: /run/secrets/tts_api_key
+      TTS_PUBLIC_PORT: "8020"
+      TTS_QWEN_URL: http://qwen-worker:8001
+      TTS_SUPERTONIC_URL: http://supertonic-worker:7788
+    secrets:
+      - source: tts_api_key
+        target: /run/secrets/tts_api_key
+    ports:
+      - target: 8020
+        published: "${TTS_PORT}"
+        host_ip: "${TTS_BIND_HOST}"
+        protocol: tcp
+    depends_on:
+      qwen-worker:
+        condition: service_healthy
+      supertonic-worker:
+        condition: service_healthy
+    networks:
+      - tts-private
+    restart: unless-stopped
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp
+    healthcheck:
+      test:
+        - CMD
+        - /app/.venv/bin/python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://127.0.0.1:8020/healthz', timeout=5).read()
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  qwen-worker:
+    image: tts-qwen-worker:latest
+    build:
+      context: .
+      dockerfile: docker/qwen.Dockerfile
+    command:
+      - uv
+      - run
+      - uvicorn
+      - tts_playground.qwen.app:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8001"
+    user: "${TTS_UID}:${TTS_GID}"
+    environment:
+      HF_HOME: /cache/huggingface
+      HOME: /tmp
+      QWEN_MAX_WAITING: "${QWEN_MAX_WAITING}"
+      QWEN_QUEUE_TIMEOUT_SECONDS: "${QWEN_QUEUE_TIMEOUT_SECONDS}"
+      QWEN_IDLE_UNLOAD_SECONDS: "${QWEN_IDLE_UNLOAD_SECONDS}"
+      QWEN_MIN_FREE_VRAM_BYTES: "${QWEN_MIN_FREE_VRAM_BYTES}"
+      QWEN_ERROR_COOLDOWN_SECONDS: "${QWEN_ERROR_COOLDOWN_SECONDS}"
+      QWEN_ATTENTION_IMPLEMENTATION: "${QWEN_ATTENTION_IMPLEMENTATION}"
+      QWEN_VOICE_DATA_DIR: /data/voices
+    volumes:
+      - type: bind
+        source: "${TTS_HF_CACHE_DIR}"
+        target: /cache/huggingface
+      - type: bind
+        source: "${TTS_DATA_DIR}"
+        target: /data
+    networks:
+      - tts-private
+      - model-egress
+    restart: unless-stopped
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp
+    shm_size: 2gb
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities:
+                - gpu
+    healthcheck:
+      test:
+        - CMD
+        - /app/.venv/bin/python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/healthz', timeout=5).read()
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  supertonic-worker:
+    image: tts-supertonic-worker:latest
+    build:
+      context: .
+      dockerfile: docker/supertonic.Dockerfile
+    command:
+      - supertonic
+      - serve
+      - --host
+      - 0.0.0.0
+      - --port
+      - "7788"
+    user: "${TTS_UID}:${TTS_GID}"
+    environment:
+      HOME: /home/app
+    volumes:
+      - type: bind
+        source: "${TTS_SUPERTONIC_CACHE_DIR}"
+        target: /home/app/.cache/supertonic3
+    networks:
+      - tts-private
+      - model-egress
+    restart: unless-stopped
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://127.0.0.1:7788/v1/styles', timeout=5).read()
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+networks:
+  tts-private:
+    internal: true
+  model-egress: {}
+
+secrets:
+  tts_api_key:
+    file: ./secrets/tts_api_key.txt

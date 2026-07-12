@@ -1,0 +1,15 @@
+.git
+.env
+.venv
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.superpowers
+.worktrees
+__pycache__
+*.py[cod]
+secrets
+results
+*.wav
+*.flac
+*.ogg
