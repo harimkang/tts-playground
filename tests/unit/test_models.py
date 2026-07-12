@@ -1,5 +1,5 @@
 from tts_playground.common.errors import ServiceError
-from tts_playground.common.models import QWEN_REPOSITORIES, ModelID
+from tts_playground.common.models import QWEN_CUSTOM_SPEAKERS, QWEN_REPOSITORIES, ModelID
 
 
 def test_public_model_ids_are_stable() -> None:
@@ -18,3 +18,17 @@ def test_service_error_string_is_its_public_message() -> None:
     error = ServiceError(status_code=503, code="worker_unavailable", message="Worker unavailable")
 
     assert str(error) == "Worker unavailable"
+
+
+def test_qwen_custom_voice_speaker_contract_is_exact() -> None:
+    assert QWEN_CUSTOM_SPEAKERS == (
+        "Vivian",
+        "Serena",
+        "Uncle_Fu",
+        "Dylan",
+        "Eric",
+        "Ryan",
+        "Aiden",
+        "Ono_Anna",
+        "Sohee",
+    )

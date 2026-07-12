@@ -96,6 +96,16 @@ def test_gateway_consumes_api_key_as_a_file_secret(
     assert gateway["environment"]["TTS_API_KEY_FILE"] == "/run/secrets/tts_api_key"
 
 
+def test_gateway_exposes_backend_timeouts_from_environment(
+    compose_config: dict[str, Any],
+) -> None:
+    environment = compose_config["services"]["tts-gateway"]["environment"]
+
+    assert environment["TTS_QWEN_TIMEOUT_SECONDS"] == "360"
+    assert environment["TTS_SUPERTONIC_TIMEOUT_SECONDS"] == "60"
+    assert environment["TTS_MAX_SYNTHESIS_BODY_BYTES"] == "65536"
+
+
 def test_qwen_mounts_model_cache_and_voice_data(compose_config: dict[str, Any]) -> None:
     volumes = compose_config["services"]["qwen-worker"]["volumes"]
     writable_bind_mounts = {
@@ -238,6 +248,16 @@ def test_python_images_use_uv_managed_frozen_environments() -> None:
     assert (
         "uv sync --frozen --no-dev --extra supertonic --no-install-project"
         in dockerfiles["supertonic.Dockerfile"]
+    )
+
+
+def test_supertonic_loads_privacy_filter_at_interpreter_startup() -> None:
+    dockerfile = (ROOT / "docker" / "supertonic.Dockerfile").read_text(encoding="utf-8")
+
+    assert "PYTHONPATH=/app/privacy" in dockerfile
+    assert (
+        "COPY docker/supertonic_privacy/sitecustomize.py /app/privacy/sitecustomize.py"
+        in dockerfile
     )
 
 

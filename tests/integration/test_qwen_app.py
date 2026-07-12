@@ -218,12 +218,17 @@ def test_readiness_recovers_after_error_cooldown(tmp_path: Path) -> None:
     assert ready.json() == {"status": "ready", "state": "error"}
 
 
-def test_unexpected_worker_error_uses_safe_internal_envelope(tmp_path: Path) -> None:
+def test_unexpected_worker_error_is_sanitized_without_reraise_or_log_leak(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    marker = "PRIVATE_QWEN_EXCEPTION_MARKER"
     adapter = FakeAdapter()
-    adapter.synthesis_error = RuntimeError("private inference detail")
+    adapter.synthesis_error = RuntimeError(marker)
     app = create_qwen_app(_settings(tmp_path), adapter)
 
-    with TestClient(app, raise_server_exceptions=False) as client:
+    with TestClient(app) as client:
         response = client.post(
             "/internal/v1/speech",
             headers={"X-Request-ID": "req_internal-error"},
@@ -238,7 +243,20 @@ def test_unexpected_worker_error_uses_safe_internal_envelope(tmp_path: Path) -> 
             "request_id": "req_internal-error",
         }
     }
-    assert "private inference detail" not in response.text
+    assert marker not in response.text
+    assert marker not in caplog.text
+    assert marker not in capsys.readouterr().out
+
+
+def test_normalized_worker_method_error_preserves_allow_header(tmp_path: Path) -> None:
+    app = create_qwen_app(_settings(tmp_path), FakeAdapter())
+
+    with TestClient(app) as client:
+        response = client.get("/internal/v1/speech")
+
+    assert response.status_code == 405
+    assert response.headers["Allow"] == "POST"
+    assert response.json()["error"]["code"] == "method_not_allowed"
 
 
 def test_voice_registration_list_detail_and_delete(tmp_path: Path) -> None:

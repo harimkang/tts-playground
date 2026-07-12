@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from time import perf_counter
@@ -13,6 +13,7 @@ from fastapi.responses import JSONResponse
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from starlette.exceptions import HTTPException
 from starlette.responses import Response
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from tts_playground.common.errors import ServiceError
 from tts_playground.common.request_id import resolve_request_id
@@ -146,6 +147,7 @@ def create_qwen_app(settings: QwenSettings, adapter: QwenAdapter) -> FastAPI:
             code=code,
             message=message,
             request_id=_request_id(request),
+            headers=_safe_http_exception_headers(error.headers),
         )
 
     @app.exception_handler(Exception)
@@ -277,6 +279,7 @@ def create_qwen_app(settings: QwenSettings, adapter: QwenAdapter) -> FastAPI:
         _manager(request).invalidate_voice(voice_id)
         return Response(status_code=204)
 
+    app.add_middleware(_SanitizedExceptionMiddleware)
     return app
 
 
@@ -332,9 +335,17 @@ def _request_id(request: Request) -> str:
     return resolve_request_id(None)
 
 
-def _error_response(*, status_code: int, code: str, message: str, request_id: str) -> JSONResponse:
+def _error_response(
+    *,
+    status_code: int,
+    code: str,
+    message: str,
+    request_id: str,
+    headers: Mapping[str, str] | None = None,
+) -> JSONResponse:
     return JSONResponse(
         status_code=status_code,
+        headers=headers,
         content={
             "error": {
                 "code": code,
@@ -343,6 +354,54 @@ def _error_response(*, status_code: int, code: str, message: str, request_id: st
             }
         },
     )
+
+
+def _safe_http_exception_headers(headers: Mapping[str, str] | None) -> dict[str, str] | None:
+    if not headers:
+        return None
+    safe_names = {"allow", "retry-after", "www-authenticate"}
+    safe_headers = {name: value for name, value in headers.items() if name.lower() in safe_names}
+    return safe_headers or None
+
+
+class _SanitizedExceptionMiddleware:
+    def __init__(self, app: ASGIApp) -> None:
+        self._app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self._app(scope, receive, send)
+            return
+        response_started = False
+
+        async def track_start(message: Message) -> None:
+            nonlocal response_started
+            if message["type"] == "http.response.start":
+                response_started = True
+            await send(message)
+
+        try:
+            await self._app(scope, receive, track_start)
+        except Exception:
+            if response_started:
+                return
+            request_id = resolve_request_id(_scope_header(scope, b"x-request-id"))
+            response = _error_response(
+                status_code=500,
+                code="internal_error",
+                message="Internal worker error.",
+                request_id=request_id,
+            )
+            response.headers["X-Request-ID"] = request_id
+            await response(scope, receive, send)
+
+
+def _scope_header(scope: Scope, name: bytes) -> str | None:
+    headers = cast(list[tuple[bytes, bytes]], scope.get("headers", []))
+    for header_name, value in headers:
+        if header_name.lower() == name:
+            return value.decode("latin-1")
+    return None
 
 
 app = create_qwen_app(QwenSettings(), QwenTTSAdapter())

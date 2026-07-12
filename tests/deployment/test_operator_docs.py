@@ -4,6 +4,15 @@ from pathlib import Path
 ROOT = Path(__file__).parents[2]
 
 
+def test_backend_timeout_configuration_is_documented() -> None:
+    env_example = (ROOT / ".env.example").read_text(encoding="utf-8")
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+
+    for name in ("TTS_QWEN_TIMEOUT_SECONDS", "TTS_SUPERTONIC_TIMEOUT_SECONDS"):
+        assert name in env_example
+        assert name in readme
+
+
 def test_readme_documents_complete_uv_locked_operator_workflow() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
 

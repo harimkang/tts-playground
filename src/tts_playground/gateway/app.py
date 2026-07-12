@@ -1,7 +1,8 @@
-from collections.abc import AsyncIterator, Awaitable, Callable
+import json
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from time import perf_counter
-from typing import Annotated, Protocol, runtime_checkable
+from typing import Annotated, Protocol, cast, runtime_checkable
 
 import httpx
 from fastapi import Depends, FastAPI, Header, Request
@@ -9,6 +10,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException
 from starlette.responses import Response
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from tts_playground.common.errors import ServiceError
 from tts_playground.common.logging import (
@@ -98,6 +100,7 @@ def create_gateway_app(
             code=code,
             message=message,
             request_id=_request_id(request),
+            headers=_safe_http_exception_headers(error.headers),
         )
 
     @app.get("/healthz")
@@ -132,10 +135,11 @@ def create_gateway_app(
                 elapsed_seconds=perf_counter() - started_at,
                 audio_seconds=None,
             )
-            metrics.record_backend_error(
-                backend=_backend_name(speech_request.model),
-                code=telemetry_error_code,
-            )
+            if error.backend_failure:
+                metrics.record_backend_error(
+                    backend=_backend_name(speech_request.model),
+                    code=telemetry_error_code,
+                )
             log_gateway_request(
                 request_id=request_id,
                 model=model,
@@ -169,6 +173,10 @@ def create_gateway_app(
         _copy_header(headers, "X-Processing-Ms", audio.processing_ms)
         return Response(content=audio.content, headers=headers)
 
+    app.add_middleware(
+        _SynthesisBodyLimitMiddleware,
+        maximum_bytes=settings.max_synthesis_body_bytes,
+    )
     return app
 
 
@@ -281,9 +289,17 @@ def _request_id(request: Request) -> str:
     return resolve_request_id(None)
 
 
-def _error_response(*, status_code: int, code: str, message: str, request_id: str) -> JSONResponse:
+def _error_response(
+    *,
+    status_code: int,
+    code: str,
+    message: str,
+    request_id: str,
+    headers: dict[str, str] | None = None,
+) -> JSONResponse:
     return JSONResponse(
         status_code=status_code,
+        headers=headers,
         content={
             "error": {
                 "code": code,
@@ -292,6 +308,105 @@ def _error_response(*, status_code: int, code: str, message: str, request_id: st
             }
         },
     )
+
+
+def _safe_http_exception_headers(headers: Mapping[str, str] | None) -> dict[str, str] | None:
+    if not headers:
+        return None
+    safe_names = {"allow", "retry-after", "www-authenticate"}
+    safe_headers = {name: value for name, value in headers.items() if name.lower() in safe_names}
+    return safe_headers or None
+
+
+class _SynthesisBodyLimitMiddleware:
+    def __init__(self, app: ASGIApp, maximum_bytes: int) -> None:
+        self._app = app
+        self._maximum_bytes = maximum_bytes
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if not self._applies(scope):
+            await self._app(scope, receive, send)
+            return
+
+        request_id = resolve_request_id(_scope_header(scope, b"x-request-id"))
+        content_length = _parse_content_length(_scope_header(scope, b"content-length"))
+        if content_length is not None and content_length > self._maximum_bytes:
+            await _send_request_too_large(send, request_id)
+            return
+
+        messages: list[Message] = []
+        received_bytes = 0
+        while True:
+            message = await receive()
+            if message["type"] != "http.request":
+                messages.append(message)
+                break
+            body = message.get("body", b"")
+            received_bytes += len(body)
+            if received_bytes > self._maximum_bytes:
+                await _send_request_too_large(send, request_id)
+                return
+            messages.append(message)
+            if not message.get("more_body", False):
+                break
+
+        async def replay_receive() -> Message:
+            if messages:
+                return messages.pop(0)
+            return await receive()
+
+        await self._app(scope, replay_receive, send)
+
+    @staticmethod
+    def _applies(scope: Scope) -> bool:
+        return (
+            scope["type"] == "http"
+            and scope.get("method") == "POST"
+            and scope.get("path") == "/v1/audio/speech"
+        )
+
+
+def _scope_header(scope: Scope, name: bytes) -> str | None:
+    headers = cast(list[tuple[bytes, bytes]], scope.get("headers", []))
+    for header_name, value in headers:
+        if header_name.lower() == name:
+            return value.decode("latin-1")
+    return None
+
+
+def _parse_content_length(value: str | None) -> int | None:
+    if value is None:
+        return None
+    try:
+        parsed = int(value)
+    except ValueError:
+        return None
+    return parsed if parsed >= 0 else None
+
+
+async def _send_request_too_large(send: Send, request_id: str) -> None:
+    body = json.dumps(
+        {
+            "error": {
+                "code": "request_too_large",
+                "message": "Synthesis request exceeds the size limit.",
+                "request_id": request_id,
+            }
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+    await send(
+        {
+            "type": "http.response.start",
+            "status": 413,
+            "headers": [
+                (b"content-length", str(len(body)).encode("ascii")),
+                (b"content-type", b"application/json"),
+                (b"x-request-id", request_id.encode("ascii")),
+            ],
+        }
+    )
+    await send({"type": "http.response.body", "body": body})
 
 
 def _backend_name(model: ModelID) -> str:

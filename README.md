@@ -197,7 +197,7 @@ JSON errors contain `error.code`, a safe message, and `request_id`. The public c
 | 404 | `voice_not_found` | The supplied registered voice ID does not exist. List voices and retry with a current ID. |
 | 405 | `method_not_allowed` | The route exists but does not accept that HTTP method. |
 | 413 | `audio_too_large` | Reference audio exceeds 20 MB. |
-| 413 | `request_too_large` | The complete multipart request exceeds its bounded size. |
+| 413 | `request_too_large` | A synthesis JSON or complete multipart request exceeds its bounded size. |
 | 422 | `validation_error` | JSON/form data or model-specific fields fail public schema validation. |
 | 422 | `unsupported_language` | The selected backend does not support the requested language code. |
 | 422 | `consent_required` | Voice registration did not attest `consent_confirmed=true`. |
@@ -231,6 +231,8 @@ Operational limits can change without changing clients or public model IDs. Edit
 - `QWEN_ERROR_COOLDOWN_SECONDS`: recovery cooldown.
 - `QWEN_ATTENTION_IMPLEMENTATION`: explicit supported attention backend; `sdpa` is the safe default.
 - `TTS_BIND_HOST` and `TTS_PORT`: gateway bind address and published port.
+- `TTS_QWEN_TIMEOUT_SECONDS` and `TTS_SUPERTONIC_TIMEOUT_SECONDS`: private-worker request timeouts.
+- `TTS_MAX_SYNTHESIS_BODY_BYTES`: pre-authentication JSON body limit; keep it large enough for the public text and instruction limits.
 - `TTS_HF_CACHE_DIR`, `TTS_SUPERTONIC_CACHE_DIR`, and `TTS_DATA_DIR`: persistent host paths.
 
 Keep one active Qwen generation on this single-GPU playground. Raising queue capacity does not add GPU concurrency, and lowering the VRAM guard can interfere with the existing GPU workload.

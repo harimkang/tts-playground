@@ -134,14 +134,16 @@ async def test_routes_qwen_with_public_model_and_normalized_language(
 @respx.mock
 async def test_preserves_backend_error_but_replaces_request_id(
     app_client: httpx.AsyncClient,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
+    marker = "PRIVATE_QWEN_UPSTREAM_MESSAGE_MARKER"
     respx.post("http://qwen-worker:8001/internal/v1/speech").mock(
         return_value=httpx.Response(
             503,
             json={
                 "error": {
                     "code": "gpu_memory_unavailable",
-                    "message": "Not enough free GPU memory.",
+                    "message": marker,
                     "request_id": "req_backend-private",
                 }
             },
@@ -164,10 +166,12 @@ async def test_preserves_backend_error_but_replaces_request_id(
     assert response.json() == {
         "error": {
             "code": "gpu_memory_unavailable",
-            "message": "Not enough free GPU memory.",
+            "message": "Backend request failed.",
             "request_id": "req_gateway-error",
         }
     }
+    assert marker not in response.text
+    assert marker not in capsys.readouterr().out
 
     metrics = await app_client.get("/metrics", headers=_authorization())
     assert (
@@ -396,6 +400,26 @@ async def test_maps_backend_transport_errors(
     assert response.json()["error"]["code"] == expected_code
     assert "offline" not in response.text
     assert "slow" not in response.text
+
+
+async def test_local_validation_failure_is_not_counted_as_backend_error(
+    app_client: httpx.AsyncClient,
+) -> None:
+    response = await app_client.post(
+        "/v1/audio/speech",
+        headers=_authorization("req_local-language-error"),
+        json={
+            "model": "supertonic-3",
+            "input": "test",
+            "voice": "F1",
+            "language": "zz",
+        },
+    )
+    metrics = await app_client.get("/metrics", headers=_authorization())
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "unsupported_language"
+    assert "tts_gateway_backend_errors_total{" not in metrics.text
 
 
 @respx.mock

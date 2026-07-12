@@ -300,6 +300,7 @@ class BackendRouter:
                 status_code=503,
                 code="backend_unavailable",
                 message="Required backend is unavailable.",
+                backend_failure=True,
             ) from error
         if response.is_success:
             return
@@ -307,6 +308,7 @@ class BackendRouter:
             status_code=503,
             code="backend_unavailable",
             message="Required backend is unavailable.",
+            backend_failure=True,
         )
 
     async def _post_supertonic(
@@ -403,12 +405,14 @@ class BackendRouter:
                 status_code=504,
                 code="backend_timeout",
                 message="Backend request timed out.",
+                backend_failure=True,
             ) from error
         except httpx.RequestError as error:
             raise ServiceError(
                 status_code=503,
                 code="backend_unavailable",
                 message="Backend is unavailable.",
+                backend_failure=True,
             ) from error
 
 
@@ -612,6 +616,7 @@ def _invalid_backend_response() -> ServiceError:
         status_code=503,
         code="backend_invalid_response",
         message="Backend returned an invalid response.",
+        backend_failure=True,
     )
 
 
@@ -625,18 +630,19 @@ def _raise_upstream_error(response: httpx.Response) -> None:
         error = payload.get("error")
         if isinstance(error, dict):
             code = error.get("code")
-            message = error.get("message")
-            if isinstance(code, str) and isinstance(message, str):
+            if isinstance(code, str):
                 raise ServiceError(
                     status_code=response.status_code,
                     code=normalize_error_code(code) or "backend_error",
-                    message=message,
+                    message="Backend request failed.",
+                    backend_failure=True,
                 )
 
     raise ServiceError(
         status_code=response.status_code,
         code="backend_error",
         message="Backend request failed.",
+        backend_failure=True,
     )
 
 
@@ -650,4 +656,5 @@ def _validate_wav_response(response: httpx.Response) -> None:
         status_code=503,
         code="backend_invalid_response",
         message="Backend returned an invalid audio response.",
+        backend_failure=True,
     )

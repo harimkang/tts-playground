@@ -2,7 +2,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from tts_playground.common.models import ModelID
+from tts_playground.common.models import QWEN_CUSTOM_SPEAKERS, ModelID
 
 
 class SpeechRequest(BaseModel):
@@ -29,8 +29,11 @@ class SpeechRequest(BaseModel):
 
         if self.speed != 1.0 or self.steps is not None:
             raise ValueError("Qwen does not support speed or steps")
-        if self.model == ModelID.QWEN_CUSTOM and not self.voice:
-            raise ValueError("CustomVoice requires voice")
+        if self.model == ModelID.QWEN_CUSTOM:
+            if not self.voice:
+                raise ValueError("CustomVoice requires voice")
+            if self.voice not in QWEN_CUSTOM_SPEAKERS:
+                raise ValueError("CustomVoice uses an unsupported CustomVoice speaker")
         if self.model == ModelID.QWEN_DESIGN:
             if not self.instructions or self.voice is not None:
                 raise ValueError("VoiceDesign requires instructions and rejects voice")
@@ -38,4 +41,6 @@ class SpeechRequest(BaseModel):
             not self.voice or not self.voice.startswith("voice_")
         ):
             raise ValueError("Voice clone requires a registered voice ID")
+        if self.model == ModelID.QWEN_CLONE and self.instructions is not None:
+            raise ValueError("Voice clone does not support instructions")
         return self

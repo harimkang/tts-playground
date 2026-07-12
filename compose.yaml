@@ -21,6 +21,9 @@ services:
       TTS_PUBLIC_PORT: "8020"
       TTS_QWEN_URL: http://qwen-worker:8001
       TTS_SUPERTONIC_URL: http://supertonic-worker:7788
+      TTS_QWEN_TIMEOUT_SECONDS: "${TTS_QWEN_TIMEOUT_SECONDS}"
+      TTS_SUPERTONIC_TIMEOUT_SECONDS: "${TTS_SUPERTONIC_TIMEOUT_SECONDS}"
+      TTS_MAX_SYNTHESIS_BODY_BYTES: "${TTS_MAX_SYNTHESIS_BODY_BYTES}"
       UV_CACHE_DIR: /tmp/uv-cache
     secrets:
       - source: tts_api_key

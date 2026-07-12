@@ -6,21 +6,10 @@ import httpx
 import pytest
 import respx
 
+from tts_playground.common.models import QWEN_CUSTOM_SPEAKERS
 from tts_playground.common.settings import GatewaySettings
 from tts_playground.gateway.app import create_gateway_app
 from tts_playground.gateway.backends import BackendRouter
-
-QWEN_SPEAKERS = [
-    "Vivian",
-    "Serena",
-    "Uncle_Fu",
-    "Dylan",
-    "Eric",
-    "Ryan",
-    "Aiden",
-    "Ono_Anna",
-    "Sohee",
-]
 
 
 @pytest.fixture
@@ -137,7 +126,7 @@ async def test_models_expose_stable_ids_voices_capabilities_and_worker_state(
     }
     assert models["supertonic-3"]["worker_state"] == "ready"
     assert models["supertonic-3"]["loaded"] is True
-    assert models["qwen3-tts-1.7b-custom"]["voices"] == QWEN_SPEAKERS
+    assert models["qwen3-tts-1.7b-custom"]["voices"] == list(QWEN_CUSTOM_SPEAKERS)
     assert models["qwen3-tts-1.7b-custom"]["worker_state"] == "ready"
     assert models["qwen3-tts-1.7b-custom"]["loaded"] is True
     assert models["qwen3-tts-1.7b-design"]["loaded"] is False
@@ -283,7 +272,7 @@ async def test_voice_proxy_preserves_error_and_replaces_private_request_id(
     assert response.json() == {
         "error": {
             "code": "voice_not_found",
-            "message": "Voice was not found.",
+            "message": "Backend request failed.",
             "request_id": "req_public-error",
         }
     }

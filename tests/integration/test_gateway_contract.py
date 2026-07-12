@@ -1,6 +1,7 @@
 import re
 import warnings
 from pathlib import Path
+from typing import Any
 
 import pytest
 from starlette.exceptions import StarletteDeprecationWarning
@@ -161,6 +162,7 @@ def test_wrong_method_uses_public_error_envelope(tmp_path: Path) -> None:
     response = client.get("/v1/audio/speech", headers={"X-Request-ID": request_id})
 
     assert response.status_code == 405
+    assert response.headers["Allow"] == "POST"
     assert response.headers["X-Request-ID"] == request_id
     assert response.json() == {
         "error": {
@@ -169,6 +171,123 @@ def test_wrong_method_uses_public_error_envelope(tmp_path: Path) -> None:
             "request_id": request_id,
         }
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("authenticated", [False, True])
+async def test_oversized_speech_content_length_is_rejected_before_body_read(
+    tmp_path: Path,
+    authenticated: bool,
+) -> None:
+    key = tmp_path / "key"
+    key.write_text("secret-key\n")
+    app = create_gateway_app(
+        GatewaySettings(api_key_file=key, max_synthesis_body_bytes=64),
+        backend_router=None,
+    )
+    receive_calls = 0
+    sent: list[dict[str, Any]] = []
+
+    async def receive() -> dict[str, Any]:
+        nonlocal receive_calls
+        receive_calls += 1
+        return {"type": "http.request", "body": b"must not be read", "more_body": False}
+
+    async def send(message: dict[str, Any]) -> None:
+        sent.append(message)
+
+    headers = [
+        (b"content-type", b"application/json"),
+        (b"content-length", b"65"),
+        (b"x-request-id", b"req_content-length-limit"),
+    ]
+    if authenticated:
+        headers.append((b"authorization", b"Bearer secret-key"))
+
+    await app(
+        {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "http",
+            "path": "/v1/audio/speech",
+            "raw_path": b"/v1/audio/speech",
+            "query_string": b"",
+            "root_path": "",
+            "headers": headers,
+            "client": ("127.0.0.1", 1234),
+            "server": ("gateway", 80),
+            "state": {},
+        },
+        receive,
+        send,
+    )
+
+    assert receive_calls == 0
+    assert sent[0]["status"] == 413
+    response_headers = dict(sent[0]["headers"])
+    assert response_headers[b"x-request-id"] == b"req_content-length-limit"
+    assert b'"code":"request_too_large"' in sent[1]["body"]
+    assert b'"request_id":"req_content-length-limit"' in sent[1]["body"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("authenticated", [False, True])
+async def test_oversized_chunked_speech_stops_reading_at_limit(
+    tmp_path: Path,
+    authenticated: bool,
+) -> None:
+    key = tmp_path / "key"
+    key.write_text("secret-key\n")
+    app = create_gateway_app(
+        GatewaySettings(api_key_file=key, max_synthesis_body_bytes=64),
+        backend_router=None,
+    )
+    chunks = [b"x" * 40, b"y" * 25, b"private marker beyond limit"]
+    receive_calls = 0
+    sent: list[dict[str, Any]] = []
+
+    async def receive() -> dict[str, Any]:
+        nonlocal receive_calls
+        chunk = chunks[receive_calls]
+        receive_calls += 1
+        return {"type": "http.request", "body": chunk, "more_body": True}
+
+    async def send(message: dict[str, Any]) -> None:
+        sent.append(message)
+
+    headers = [
+        (b"content-type", b"application/json"),
+        (b"x-request-id", b"req_chunked-limit"),
+    ]
+    if authenticated:
+        headers.append((b"authorization", b"Bearer secret-key"))
+
+    await app(
+        {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "http",
+            "path": "/v1/audio/speech",
+            "raw_path": b"/v1/audio/speech",
+            "query_string": b"",
+            "root_path": "",
+            "headers": headers,
+            "client": ("127.0.0.1", 1234),
+            "server": ("gateway", 80),
+            "state": {},
+        },
+        receive,
+        send,
+    )
+
+    assert receive_calls == 2
+    assert sent[0]["status"] == 413
+    assert b'"code":"request_too_large"' in sent[1]["body"]
+    assert b"private marker beyond limit" not in sent[1]["body"]
 
 
 def test_validation_errors_use_public_envelope(tmp_path: Path) -> None:

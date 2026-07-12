@@ -12,6 +12,7 @@ class GatewaySettings(BaseSettings):
     supertonic_url: str = "http://supertonic-worker:7788"
     qwen_timeout_seconds: float = 360.0
     supertonic_timeout_seconds: float = 60.0
+    max_synthesis_body_bytes: int = 64 * 1024
     max_upload_bytes: int = 20 * 1024 * 1024
 
 

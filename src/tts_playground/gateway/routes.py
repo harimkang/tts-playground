@@ -7,22 +7,10 @@ from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from starlette.responses import Response
 
 from tts_playground.common.errors import ServiceError
-from tts_playground.common.models import ModelID
+from tts_playground.common.models import QWEN_CUSTOM_SPEAKERS, ModelID
 from tts_playground.common.request_id import resolve_request_id
 from tts_playground.gateway.backends import DiscoveryResult, ProxyResult
 from tts_playground.gateway.metrics import GatewayMetrics
-
-QWEN_CUSTOM_SPEAKERS = [
-    "Vivian",
-    "Serena",
-    "Uncle_Fu",
-    "Dylan",
-    "Eric",
-    "Ryan",
-    "Aiden",
-    "Ono_Anna",
-    "Sohee",
-]
 
 _SUPERTONIC_CAPABILITIES = {
     "instructions": False,
@@ -239,7 +227,7 @@ def _models_response(discovery: DiscoveryResult) -> dict[str, object]:
             qwen_model(
                 ModelID.QWEN_CUSTOM,
                 _QWEN_CUSTOM_CAPABILITIES,
-                QWEN_CUSTOM_SPEAKERS,
+                list(QWEN_CUSTOM_SPEAKERS),
             ),
             qwen_model(ModelID.QWEN_DESIGN, _QWEN_DESIGN_CAPABILITIES, []),
             qwen_model(ModelID.QWEN_CLONE, _QWEN_CLONE_CAPABILITIES, []),

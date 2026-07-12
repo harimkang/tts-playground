@@ -2,6 +2,7 @@ import pytest
 from pydantic import ValidationError
 
 from tts_playground.gateway.schemas import SpeechRequest
+from tts_playground.qwen.schemas import QwenSpeechRequest
 
 
 def test_supertonic_accepts_speed_and_steps() -> None:
@@ -81,6 +82,21 @@ def test_custom_voice_requires_voice() -> None:
         )
 
 
+@pytest.mark.parametrize("schema", [SpeechRequest, QwenSpeechRequest])
+def test_custom_voice_rejects_unknown_speaker(
+    schema: type[SpeechRequest] | type[QwenSpeechRequest],
+) -> None:
+    values = {
+        "model": "qwen3-tts-1.7b-custom",
+        "voice": "UnknownSpeaker",
+        "language": "en",
+    }
+    values["input" if schema is SpeechRequest else "text"] = "test"
+
+    with pytest.raises(ValidationError, match="unsupported CustomVoice speaker"):
+        schema.model_validate(values)
+
+
 def test_voice_design_accepts_instructions_without_voice() -> None:
     request = SpeechRequest(
         model="qwen3-tts-1.7b-design",
@@ -113,6 +129,22 @@ def test_voice_clone_accepts_registered_voice_id() -> None:
     )
 
     assert request.voice == "voice_example"
+
+
+@pytest.mark.parametrize("schema", [SpeechRequest, QwenSpeechRequest])
+def test_voice_clone_rejects_instructions(
+    schema: type[SpeechRequest] | type[QwenSpeechRequest],
+) -> None:
+    values = {
+        "model": "qwen3-tts-1.7b-clone",
+        "voice": "voice_example",
+        "language": "en",
+        "instructions": "must not be silently ignored",
+    }
+    values["input" if schema is SpeechRequest else "text"] = "test"
+
+    with pytest.raises(ValidationError, match="Voice clone does not support instructions"):
+        schema.model_validate(values)
 
 
 def test_qwen_rejects_non_default_speed() -> None:

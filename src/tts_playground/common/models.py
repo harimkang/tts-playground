@@ -8,6 +8,19 @@ class ModelID(StrEnum):
     QWEN_CLONE = "qwen3-tts-1.7b-clone"
 
 
+QWEN_CUSTOM_SPEAKERS = (
+    "Vivian",
+    "Serena",
+    "Uncle_Fu",
+    "Dylan",
+    "Eric",
+    "Ryan",
+    "Aiden",
+    "Ono_Anna",
+    "Sohee",
+)
+
+
 QWEN_REPOSITORIES: dict[ModelID, str] = {
     ModelID.QWEN_CUSTOM: "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
     ModelID.QWEN_DESIGN: "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",

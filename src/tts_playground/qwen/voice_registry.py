@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from math import isfinite
 from pathlib import Path
-from typing import Final
+from typing import Final, Protocol, cast
 
 import soundfile as sf  # type: ignore[import-untyped]
 
@@ -21,6 +21,9 @@ from tts_playground.common.errors import ServiceError
 MAX_AUDIO_BYTES: Final = 20 * 1024 * 1024
 MIN_AUDIO_SECONDS: Final = 3.0
 MAX_AUDIO_SECONDS: Final = 30.0
+MAX_AUDIO_CHANNELS: Final = 2
+MAX_AUDIO_SAMPLE_RATE: Final = 192_000
+MAX_DECODED_SAMPLES: Final = 6_000_000
 _VOICE_ID_PATTERN: Final = re.compile(r"voice_[0-9a-f]{32}")
 _SUPPORTED_AUDIO_FORMATS: Final = frozenset({"FLAC", "WAV"})
 
@@ -45,6 +48,13 @@ class VoiceInternal:
     created_at: str
     transcript: str
     audio_path: Path
+
+
+class _AudioMetadata(Protocol):
+    format: str
+    frames: int
+    samplerate: int
+    channels: int
 
 
 class VoiceRegistry:
@@ -79,7 +89,12 @@ class VoiceRegistry:
 
         audio_stream = io.BytesIO(audio)
         try:
-            audio_format = sf.info(audio_stream).format
+            audio_info = sf.info(audio_stream)
+        except (sf.LibsndfileError, RuntimeError, TypeError, ValueError):
+            raise _invalid_audio() from None
+
+        duration_seconds = _validate_audio_metadata(audio_info)
+        try:
             audio_stream.seek(0)
             samples, sample_rate = sf.read(
                 audio_stream,
@@ -87,25 +102,9 @@ class VoiceRegistry:
                 always_2d=True,
             )
         except (sf.LibsndfileError, RuntimeError, TypeError, ValueError):
-            raise ServiceError(
-                status_code=400,
-                code="invalid_audio",
-                message="Reference audio is invalid.",
-            ) from None
-        if audio_format not in _SUPPORTED_AUDIO_FORMATS:
-            raise ServiceError(
-                status_code=400,
-                code="invalid_audio",
-                message="Reference audio is invalid.",
-            )
-
-        duration_seconds = len(samples) / sample_rate
-        if not MIN_AUDIO_SECONDS <= duration_seconds <= MAX_AUDIO_SECONDS:
-            raise ServiceError(
-                status_code=422,
-                code="invalid_audio_duration",
-                message="Reference audio must be between 3 and 30 seconds.",
-            )
+            raise _invalid_audio() from None
+        if sample_rate != audio_info.samplerate:
+            raise _invalid_audio()
 
         voice_id = f"voice_{uuid.uuid4().hex}"
         created_at = datetime.now(UTC).isoformat()
@@ -239,7 +238,10 @@ def _load_voice(voice_directory: Path) -> VoiceInternal | None:
         return None
     if isinstance(duration_seconds, bool) or not isinstance(duration_seconds, int | float):
         return None
-    duration_seconds = float(duration_seconds)
+    try:
+        duration_seconds = float(duration_seconds)
+    except OverflowError:
+        return None
     if not isfinite(duration_seconds) or not (
         MIN_AUDIO_SECONDS <= duration_seconds <= MAX_AUDIO_SECONDS
     ):
@@ -290,6 +292,50 @@ def _voice_not_found() -> ServiceError:
         status_code=404,
         code="voice_not_found",
         message="Voice not found.",
+    )
+
+
+def _validate_audio_metadata(audio_info: object) -> float:
+    metadata = cast(_AudioMetadata, audio_info)
+    try:
+        audio_format = metadata.format
+        frames = metadata.frames
+        sample_rate = metadata.samplerate
+        channels = metadata.channels
+    except (AttributeError, TypeError, ValueError):
+        raise _invalid_audio() from None
+    if audio_format not in _SUPPORTED_AUDIO_FORMATS:
+        raise _invalid_audio()
+    numeric_metadata = (frames, sample_rate, channels)
+    if any(
+        isinstance(value, bool) or not isinstance(value, int)
+        for value in numeric_metadata
+    ):
+        raise _invalid_audio()
+    if frames <= 0 or sample_rate <= 0 or channels <= 0:
+        raise _invalid_audio()
+
+    duration_seconds = frames / sample_rate
+    if not MIN_AUDIO_SECONDS <= duration_seconds <= MAX_AUDIO_SECONDS:
+        raise ServiceError(
+            status_code=422,
+            code="invalid_audio_duration",
+            message="Reference audio must be between 3 and 30 seconds.",
+        )
+    if (
+        channels > MAX_AUDIO_CHANNELS
+        or sample_rate > MAX_AUDIO_SAMPLE_RATE
+        or frames * channels > MAX_DECODED_SAMPLES
+    ):
+        raise _invalid_audio()
+    return duration_seconds
+
+
+def _invalid_audio() -> ServiceError:
+    return ServiceError(
+        status_code=400,
+        code="invalid_audio",
+        message="Reference audio is invalid.",
     )
 
 

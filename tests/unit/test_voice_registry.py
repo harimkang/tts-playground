@@ -5,6 +5,7 @@ import re
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -204,6 +205,66 @@ def test_out_of_range_audio_duration_is_rejected(
     assert error.value.code == "invalid_audio_duration"
 
 
+@pytest.mark.parametrize(
+    ("metadata", "expected_code"),
+    [
+        (SimpleNamespace(format="WAV", frames=0, samplerate=8_000, channels=1), "invalid_audio"),
+        (SimpleNamespace(format="WAV", frames=32_000, samplerate=0, channels=1), "invalid_audio"),
+        (
+            SimpleNamespace(format="WAV", frames=31 * 8_000, samplerate=8_000, channels=1),
+            "invalid_audio_duration",
+        ),
+        (
+            SimpleNamespace(format="FLAC", frames=32_000, samplerate=8_000, channels=3),
+            "invalid_audio",
+        ),
+        (
+            SimpleNamespace(format="WAV", frames=4 * 192_001, samplerate=192_001, channels=1),
+            "invalid_audio",
+        ),
+        (
+            SimpleNamespace(format="FLAC", frames=30 * 192_000, samplerate=192_000, channels=2),
+            "invalid_audio",
+        ),
+    ],
+    ids=[
+        "zero-frames",
+        "zero-rate",
+        "too-long",
+        "too-many-channels",
+        "excessive-rate",
+        "excessive-decoded-samples",
+    ],
+)
+def test_rejected_audio_metadata_is_never_decoded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    metadata: SimpleNamespace,
+    expected_code: str,
+) -> None:
+    read_called = False
+
+    def fail_if_read(*_args: object, **_kwargs: object) -> tuple[object, int]:
+        nonlocal read_called
+        read_called = True
+        raise AssertionError("sf.read must not run for rejected metadata")
+
+    monkeypatch.setattr(sf, "info", lambda _stream: metadata)
+    monkeypatch.setattr(sf, "read", fail_if_read)
+
+    with pytest.raises(ServiceError) as error:
+        VoiceRegistry(tmp_path).register(
+            name="pathological audio",
+            audio=b"metadata-only fixture",
+            transcript="exact transcript",
+            language="en",
+            consent_confirmed=True,
+        )
+
+    assert error.value.code == expected_code
+    assert read_called is False
+
+
 def test_oversized_audio_is_rejected_before_decode(tmp_path: Path) -> None:
     with pytest.raises(ServiceError) as error:
         VoiceRegistry(tmp_path).register(
@@ -270,6 +331,24 @@ def test_reload_rejects_non_finite_or_out_of_range_duration(
         tmp_path,
         wav_bytes,
         duration_seconds=duration_seconds,
+    )
+
+    reloaded = VoiceRegistry(tmp_path)
+
+    assert reloaded.list_public() == []
+    with pytest.raises(ServiceError) as error:
+        reloaded.get_internal(voice_id)
+    assert (error.value.status_code, error.value.code) == (404, "voice_not_found")
+
+
+def test_reload_skips_duration_that_overflows_float_conversion(
+    tmp_path: Path,
+    wav_bytes: bytes,
+) -> None:
+    voice_id = _replace_persisted_metadata(
+        tmp_path,
+        wav_bytes,
+        duration_seconds=10**400,
     )
 
     reloaded = VoiceRegistry(tmp_path)
