@@ -1,10 +1,13 @@
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from math import isfinite
 from typing import Final
 from urllib.parse import quote
 
 import httpx
+from prometheus_client.parser import text_string_to_metric_families
 from python_multipart import MultipartParser
+from python_multipart.exceptions import MultipartParseError
 from python_multipart.multipart import parse_options_header
 
 from tts_playground.common.errors import ServiceError
@@ -67,7 +70,10 @@ SUPERTONIC_LANGUAGES = {
     "na",
 }
 
-_UPLOAD_MULTIPART_OVERHEAD_BYTES: Final = 16 * 1024
+_MAX_MULTIPART_NON_AUDIO_BYTES: Final = 1024 * 1024
+_MAX_MULTIPART_HEADER_BYTES: Final = 4224
+_MAX_MULTIPART_HEADER_COUNT: Final = 8
+_MAX_MULTIPART_BOUNDARY_BYTES: Final = 200
 _PUBLIC_VOICE_FIELDS: Final = (
     "id",
     "name",
@@ -166,13 +172,19 @@ class BackendRouter:
         content_length: int | None,
         request_id: str,
     ) -> ProxyResult:
-        limiter = _MultipartAudioLimiter(content_type, self._settings.max_upload_bytes)
+        maximum_request_bytes = (
+            self._settings.max_upload_bytes + _MAX_MULTIPART_NON_AUDIO_BYTES
+        )
+        limiter = _MultipartAudioLimiter(
+            content_type,
+            maximum_audio_bytes=self._settings.max_upload_bytes,
+            maximum_request_bytes=maximum_request_bytes,
+        )
         if (
             content_length is not None
-            and content_length
-            > self._settings.max_upload_bytes + _UPLOAD_MULTIPART_OVERHEAD_BYTES
+            and content_length > maximum_request_bytes
         ):
-            raise _audio_too_large()
+            raise _multipart_request_too_large()
 
         async def bounded_content() -> AsyncIterator[bytes]:
             async for chunk in content:
@@ -244,7 +256,11 @@ class BackendRouter:
         except Exception:
             # Metrics are best-effort and must never make gateway metrics unavailable.
             return None
-        if response.status_code != 200 or not _is_prometheus_text(response):
+        if (
+            response.status_code != 200
+            or not _is_prometheus_text(response)
+            or not _is_valid_qwen_metrics(response.content)
+        ):
             return None
         return response.content
 
@@ -287,8 +303,6 @@ class BackendRouter:
             ) from error
         if response.is_success:
             return
-        if url.endswith("/readyz"):
-            _raise_upstream_error(response)
         raise ServiceError(
             status_code=503,
             code="backend_unavailable",
@@ -399,22 +413,34 @@ class BackendRouter:
 
 
 class _MultipartAudioLimiter:
-    def __init__(self, content_type: str | None, maximum: int) -> None:
-        media_type, options = parse_options_header(content_type)
+    def __init__(
+        self,
+        content_type: str | None,
+        *,
+        maximum_audio_bytes: int,
+        maximum_request_bytes: int,
+    ) -> None:
+        try:
+            media_type, options = parse_options_header(content_type)
+        except (TypeError, ValueError):
+            raise _invalid_multipart() from None
         boundary = options.get(b"boundary")
-        if media_type != b"multipart/form-data" or boundary is None:
-            raise ServiceError(
-                status_code=422,
-                code="validation_error",
-                message="Request validation failed.",
-            )
+        if (
+            media_type != b"multipart/form-data"
+            or boundary is None
+            or not 0 < len(boundary) <= _MAX_MULTIPART_BOUNDARY_BYTES
+        ):
+            raise _invalid_multipart()
         self.content_type = content_type or ""
-        self._maximum = maximum
+        self._maximum_audio_bytes = maximum_audio_bytes
+        self._maximum_request_bytes = maximum_request_bytes
         self._audio_bytes = 0
+        self._request_bytes = 0
         self._header_field = bytearray()
         self._header_value = bytearray()
         self._content_disposition = b""
         self._is_audio = False
+        self._finished = False
         self._parser = MultipartParser(
             boundary,
             {
@@ -425,14 +451,28 @@ class _MultipartAudioLimiter:
                 "on_headers_finished": self._on_headers_finished,
                 "on_part_data": self._on_part_data,
                 "on_part_end": self._on_part_end,
+                "on_end": self._on_end,
             },
+            max_header_count=_MAX_MULTIPART_HEADER_COUNT,
+            max_header_size=_MAX_MULTIPART_HEADER_BYTES,
         )
 
     def write(self, chunk: bytes) -> None:
-        self._parser.write(chunk)
+        self._request_bytes += len(chunk)
+        if self._request_bytes > self._maximum_request_bytes:
+            raise _multipart_request_too_large()
+        try:
+            self._parser.write(chunk)
+        except MultipartParseError:
+            raise _invalid_multipart() from None
 
     def finalize(self) -> None:
-        self._parser.finalize()
+        try:
+            self._parser.finalize()
+        except MultipartParseError:
+            raise _invalid_multipart() from None
+        if not self._finished:
+            raise _invalid_multipart()
 
     def _on_part_begin(self) -> None:
         self._content_disposition = b""
@@ -458,11 +498,14 @@ class _MultipartAudioLimiter:
         if not self._is_audio:
             return
         self._audio_bytes += end - start
-        if self._audio_bytes > self._maximum:
+        if self._audio_bytes > self._maximum_audio_bytes:
             raise _audio_too_large()
 
     def _on_part_end(self) -> None:
         self._is_audio = False
+
+    def _on_end(self) -> None:
+        self._finished = True
 
 
 def _read_json(response: httpx.Response) -> object:
@@ -497,6 +540,22 @@ def _read_qwen_status(response: httpx.Response) -> tuple[str, str | None]:
 def _public_voice(payload: object) -> dict[str, object]:
     if not isinstance(payload, dict) or any(field not in payload for field in _PUBLIC_VOICE_FIELDS):
         raise _invalid_backend_response()
+    if not all(
+        isinstance(payload[field], str)
+        for field in ("id", "name", "language", "created_at")
+    ):
+        raise _invalid_backend_response()
+    if type(payload["consent_confirmed"]) is not bool:
+        raise _invalid_backend_response()
+    duration = payload["duration_seconds"]
+    if type(duration) not in (int, float):
+        raise _invalid_backend_response()
+    try:
+        normalized_duration = float(duration)
+    except OverflowError:
+        raise _invalid_backend_response() from None
+    if not isfinite(normalized_duration) or normalized_duration < 0:
+        raise _invalid_backend_response()
     return {field: payload[field] for field in _PUBLIC_VOICE_FIELDS}
 
 
@@ -505,11 +564,46 @@ def _is_prometheus_text(response: httpx.Response) -> bool:
     return media_type in {"text/plain", "application/openmetrics-text"}
 
 
+def _is_valid_qwen_metrics(content: bytes) -> bool:
+    try:
+        text = content.decode("utf-8")
+        families = list(text_string_to_metric_families(text))
+    except (UnicodeDecodeError, ValueError):
+        return False
+    if not families:
+        return False
+    has_sample = False
+    for family in families:
+        if not family.name.startswith("tts_qwen_"):
+            return False
+        for sample in family.samples:
+            has_sample = True
+            if not sample.name.startswith("tts_qwen_"):
+                return False
+    return has_sample
+
+
 def _audio_too_large() -> ServiceError:
     return ServiceError(
         status_code=413,
         code="audio_too_large",
         message="Reference audio exceeds the 20 MB limit.",
+    )
+
+
+def _multipart_request_too_large() -> ServiceError:
+    return ServiceError(
+        status_code=413,
+        code="request_too_large",
+        message="Multipart request exceeds the size limit.",
+    )
+
+
+def _invalid_multipart() -> ServiceError:
+    return ServiceError(
+        status_code=422,
+        code="invalid_multipart",
+        message="Multipart request is invalid.",
     )
 
 
