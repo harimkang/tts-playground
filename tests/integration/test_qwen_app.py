@@ -8,6 +8,7 @@ import warnings
 from pathlib import Path
 
 import numpy as np
+import pytest
 import soundfile as sf
 from prometheus_client.parser import text_string_to_metric_families
 from starlette.exceptions import StarletteDeprecationWarning
@@ -28,7 +29,7 @@ class FakeAdapter:
         self.load_error: BaseException | None = None
         self.synthesis_error: BaseException | None = None
         self.synthesis_requests: list[InternalSpeechRequest] = []
-        self.unloaded = threading.Event()
+        self.device_memory_cleaned = threading.Event()
         self.audio = _wav_bytes(duration_seconds=1.25, sample_rate=16_000)
 
     def free_vram_bytes(self) -> int:
@@ -39,8 +40,8 @@ class FakeAdapter:
             raise self.load_error
         return {"repository": repository, "attention": attention_implementation}
 
-    def unload(self, model: object) -> None:
-        self.unloaded.set()
+    def cleanup_device_memory(self) -> None:
+        self.device_memory_cleaned.set()
 
     def build_clone_prompt(
         self,
@@ -338,5 +339,28 @@ def test_idle_loop_unloads_resident_model(tmp_path: Path) -> None:
     with TestClient(app) as client:
         response = client.post("/internal/v1/speech", json=_speech_body())
         assert response.status_code == 200
-        assert adapter.unloaded.wait(timeout=1.0)
+        assert adapter.device_memory_cleaned.wait(timeout=1.0)
         assert client.get("/internal/v1/status").json()["state"] == "unloaded"
+
+
+def test_lifespan_shutdown_runs_when_idle_task_has_failed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = FakeAdapter()
+
+    async def fail_idle_task(*_args: object) -> None:
+        raise RuntimeError("idle task failed")
+
+    monkeypatch.setattr(
+        "tts_playground.qwen.app._idle_unload_loop",
+        fail_idle_task,
+    )
+    app = create_qwen_app(_settings(tmp_path), adapter)
+
+    with pytest.raises(RuntimeError, match="idle task failed"):
+        with TestClient(app) as client:
+            response = client.post("/internal/v1/speech", json=_speech_body())
+            assert response.status_code == 200
+
+    assert adapter.device_memory_cleaned.is_set()

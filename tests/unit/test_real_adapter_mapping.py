@@ -204,7 +204,7 @@ def test_free_vram_does_not_require_qwen_package(torch_module: FakeTorch) -> Non
     assert adapter.free_vram_bytes() == 12_345
 
 
-def test_unload_collects_python_and_cuda_resources(
+def test_cleanup_device_memory_collects_python_and_cuda_resources(
     adapter: QwenTTSAdapter,
     torch_module: FakeTorch,
     monkeypatch: pytest.MonkeyPatch,
@@ -212,7 +212,7 @@ def test_unload_collects_python_and_cuda_resources(
     collect = Mock()
     monkeypatch.setattr("tts_playground.qwen.real_adapter.gc.collect", collect)
 
-    adapter.unload(object())
+    adapter.cleanup_device_memory()
 
     collect.assert_called_once_with()
     assert torch_module.cuda.empty_cache_calls == 1

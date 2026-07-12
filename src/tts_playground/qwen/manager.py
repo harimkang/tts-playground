@@ -105,6 +105,9 @@ class QwenModelManager:
     ) -> SynthesisResult:
         self._recover_from_error_or_raise()
         for attempt in range(2):
+            cuda_oom = False
+            model: object | None = None
+            clone_prompt: object | None = None
             try:
                 model = await self._ensure_model(request.model, checkpoint)
                 self._touch_resident_model()
@@ -116,8 +119,20 @@ class QwenModelManager:
                     clone_prompt,
                 )
             except CudaOutOfMemory:
+                cuda_oom = True
+            except asyncio.CancelledError:
+                self._touch_resident_model()
+                raise
+            except Exception:
+                self._touch_resident_model()
+                checkpoint.raise_if_requested()
+                raise
+
+            if cuda_oom:
+                model = None
+                clone_prompt = None
                 try:
-                    await self._unload_model(checkpoint)
+                    await self._unload_model(checkpoint, cleanup_if_unloaded=True)
                 except asyncio.CancelledError:
                     if attempt == 1:
                         self._enter_error("cuda_out_of_memory")
@@ -130,13 +145,6 @@ class QwenModelManager:
                     code="cuda_out_of_memory",
                     message="Qwen ran out of GPU memory.",
                 ) from None
-            except asyncio.CancelledError:
-                self._touch_resident_model()
-                raise
-            except Exception:
-                self._touch_resident_model()
-                checkpoint.raise_if_requested()
-                raise
 
             self._last_used_at = self._monotonic()
             self._last_error_code = None
@@ -259,15 +267,14 @@ class QwenModelManager:
         checkpoint.raise_if_requested()
         return prompt
 
-    async def _unload_model(self, checkpoint: _CancellationCheckpoint) -> None:
-        model = self._model
+    async def _unload_model(
+        self,
+        checkpoint: _CancellationCheckpoint,
+        *,
+        cleanup_if_unloaded: bool = False,
+    ) -> None:
+        had_model = self._model is not None
         loaded_model = self._loaded_model
-        if model is not None:
-            try:
-                await checkpoint.run(self._adapter.unload, model)
-            except Exception:
-                checkpoint.raise_if_requested()
-                raise
         self._model = None
         self._loaded_model = None
         self._last_used_at = None
@@ -275,6 +282,12 @@ class QwenModelManager:
             self._clone_prompts.clear()
         if self._state != WorkerState.ERROR:
             self._state = WorkerState.UNLOADED
+        if had_model or cleanup_if_unloaded:
+            try:
+                await checkpoint.run(self._adapter.cleanup_device_memory)
+            except Exception:
+                checkpoint.raise_if_requested()
+                raise
         checkpoint.raise_if_requested()
 
     def _is_idle_unload_due(self) -> bool:

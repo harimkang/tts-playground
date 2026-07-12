@@ -108,9 +108,8 @@ class QwenTTSAdapter:
             attn_implementation=attention_implementation,
         )
 
-    def unload(self, model: object) -> None:
+    def cleanup_device_memory(self) -> None:
         torch_module = self._torch()
-        del model
         gc.collect()
         self._with_oom_conversion(torch_module.cuda.empty_cache)
         self._with_oom_conversion(torch_module.cuda.ipc_collect)

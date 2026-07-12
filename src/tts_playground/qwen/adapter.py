@@ -32,7 +32,7 @@ class QwenAdapter(Protocol):
     def load(self, repository: str, attention_implementation: str) -> object:
         raise NotImplementedError
 
-    def unload(self, model: object) -> None:
+    def cleanup_device_memory(self) -> None:
         raise NotImplementedError
 
     def build_clone_prompt(

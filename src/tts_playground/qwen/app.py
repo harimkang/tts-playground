@@ -49,8 +49,8 @@ class _ObservedAdapter:
     def load(self, repository: str, attention_implementation: str) -> object:
         return self._adapter.load(repository, attention_implementation)
 
-    def unload(self, model: object) -> None:
-        self._adapter.unload(model)
+    def cleanup_device_memory(self) -> None:
+        self._adapter.cleanup_device_memory()
 
     def build_clone_prompt(
         self,
@@ -88,12 +88,16 @@ def create_qwen_app(settings: QwenSettings, adapter: QwenAdapter) -> FastAPI:
         try:
             yield
         finally:
-            idle_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await idle_task
-            await manager.shutdown()
-            application.state.qwen_manager = None
-            application.state.voice_registry = None
+            try:
+                idle_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await idle_task
+            finally:
+                try:
+                    await manager.shutdown()
+                finally:
+                    application.state.qwen_manager = None
+                    application.state.voice_registry = None
 
     app = FastAPI(lifespan=lifespan)
     app.state.qwen_manager = None

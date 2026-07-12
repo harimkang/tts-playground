@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import io
 import threading
+import weakref
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,7 +25,7 @@ from tts_playground.qwen.manager import QwenModelManager, WorkerState
 from tts_playground.qwen.voice_registry import VoiceRegistry
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, weakref_slot=True)
 class FakeModel:
     name: str
     generation: int
@@ -66,6 +68,8 @@ class FakeAdapter:
         self._synthesis_lock = threading.Lock()
         self._load_attempts = 0
         self._generation = 0
+        self.model_references: list[weakref.ReferenceType[FakeModel]] = []
+        self.models_alive_during_cleanup: list[list[bool]] = []
 
     def _record_thread(self, call: str) -> None:
         self.thread_calls.append((call, threading.get_ident()))
@@ -98,13 +102,18 @@ class FakeAdapter:
         if self.load_failures:
             raise self.load_failures.pop(0)
         self._generation += 1
-        return FakeModel(name=name, generation=self._generation)
+        model = FakeModel(name=name, generation=self._generation)
+        self.model_references.append(weakref.ref(model))
+        return model
 
-    def unload(self, model: object) -> None:
-        self._record_thread("unload")
-        assert isinstance(model, FakeModel)
-        self.events.append(f"unload:{model.name}")
-        self._block_if_configured("unload")
+    def cleanup_device_memory(self) -> None:
+        self._record_thread("cleanup_device_memory")
+        gc.collect()
+        self.models_alive_during_cleanup.append(
+            [model_reference() is not None for model_reference in self.model_references]
+        )
+        self.events.append("cleanup")
+        self._block_if_configured("cleanup_device_memory")
 
     def build_clone_prompt(
         self,
@@ -274,7 +283,7 @@ async def test_second_request_reuses_resident_custom_model(
     assert fake_adapter.free_vram_calls == 1
 
 
-async def test_switch_unloads_before_next_load(
+async def test_switch_releases_model_before_cleanup_and_next_load(
     manager: QwenModelManager,
     fake_adapter: FakeAdapter,
 ) -> None:
@@ -284,10 +293,11 @@ async def test_switch_unloads_before_next_load(
     assert fake_adapter.events == [
         "load:custom",
         "synthesize:custom",
-        "unload:custom",
+        "cleanup",
         "load:design",
         "synthesize:design",
     ]
+    assert fake_adapter.models_alive_during_cleanup == [[False]]
 
 
 async def test_free_vram_guard_rejects_without_loading(
@@ -305,7 +315,7 @@ async def test_free_vram_guard_rejects_without_loading(
     assert manager.status().state == WorkerState.UNLOADED
 
 
-async def test_one_cuda_oom_unloads_and_retries_once(
+async def test_one_cuda_oom_releases_model_before_cleanup_and_retries_once(
     manager: QwenModelManager,
     fake_adapter: FakeAdapter,
 ) -> None:
@@ -317,10 +327,11 @@ async def test_one_cuda_oom_unloads_and_retries_once(
     assert fake_adapter.events == [
         "load:custom",
         "synthesize:custom",
-        "unload:custom",
+        "cleanup",
         "load:custom",
         "synthesize:custom",
     ]
+    assert fake_adapter.models_alive_during_cleanup == [[False]]
     assert manager.status().state == WorkerState.READY
 
 
@@ -397,7 +408,8 @@ async def test_unload_if_idle_unloads_only_after_configured_interval(
 
     clock.advance(1.0)
     await manager.unload_if_idle()
-    assert fake_adapter.events[-1] == "unload:custom"
+    assert fake_adapter.events[-1] == "cleanup"
+    assert fake_adapter.models_alive_during_cleanup == [[False]]
     status = manager.status()
     assert (status.state, status.loaded_model) == (WorkerState.UNLOADED, None)
 
@@ -416,7 +428,7 @@ async def test_invalid_clone_lookup_still_starts_resident_idle_timer(
     assert manager.status().loaded_model == ModelID.QWEN_CLONE
     clock.advance(600.0)
     await manager.unload_if_idle()
-    assert fake_adapter.events == ["load:base", "unload:base"]
+    assert fake_adapter.events == ["load:base", "cleanup"]
 
 
 async def test_non_oom_synthesis_failure_still_starts_resident_idle_timer(
@@ -435,7 +447,7 @@ async def test_non_oom_synthesis_failure_still_starts_resident_idle_timer(
     assert fake_adapter.events == [
         "load:custom",
         "synthesize:custom",
-        "unload:custom",
+        "cleanup",
     ]
 
 
@@ -456,7 +468,7 @@ async def test_failed_use_of_resident_model_resets_idle_timer(
 
     clock.advance(1.0)
     await manager.unload_if_idle()
-    assert fake_adapter.events[-1] == "unload:custom"
+    assert fake_adapter.events[-1] == "cleanup"
 
 
 async def test_clone_prompts_are_per_voice_and_cleared_when_base_unloads(
@@ -506,7 +518,7 @@ async def test_all_blocking_adapter_calls_run_off_the_event_loop(
         "load",
         "build_clone_prompt",
         "synthesize",
-        "unload",
+        "cleanup_device_memory",
     }
     main_thread = threading.get_ident()
     assert all(thread_id != main_thread for _, thread_id in fake_adapter.thread_calls)
@@ -571,7 +583,7 @@ async def test_cancellation_during_load_preserves_model_and_stops_before_synthes
 
     clock.advance(600.0)
     await manager.unload_if_idle()
-    assert fake_adapter.events[-1] == "unload:custom"
+    assert fake_adapter.events[-1] == "cleanup"
 
 
 async def test_cancellation_during_clone_prompt_stops_before_synthesis(
@@ -594,25 +606,30 @@ async def test_cancellation_during_clone_prompt_stops_before_synthesis(
     assert manager.status().loaded_model == ModelID.QWEN_CLONE
 
 
-async def test_cancellation_during_oom_cleanup_stops_before_retry(
+async def test_cancellation_during_oom_waits_for_cleanup_before_propagating(
     manager: QwenModelManager,
     fake_adapter: FakeAdapter,
 ) -> None:
     fake_adapter.synthesize_oom_failures = 1
     fake_adapter.block_synthesis = True
+    fake_adapter.block_call = "cleanup_device_memory"
     synthesis = asyncio.create_task(manager.synthesize(custom_request()))
     assert await asyncio.to_thread(fake_adapter.first_synthesis_started.wait, 1.0)
 
     synthesis.cancel()
     fake_adapter.release_synthesis.set()
+    assert await asyncio.to_thread(fake_adapter.blocked_call_started.wait, 1.0)
+    assert not synthesis.done()
+    fake_adapter.release_blocked_call.set()
     with pytest.raises(asyncio.CancelledError):
         await synthesis
 
     assert fake_adapter.events == [
         "load:custom",
         "synthesize:custom",
-        "unload:custom",
+        "cleanup",
     ]
+    assert fake_adapter.models_alive_during_cleanup == [[False]]
     assert manager.status().state == WorkerState.UNLOADED
 
 
@@ -633,10 +650,10 @@ async def test_cancellation_during_second_oom_commits_error_cooldown(
     assert fake_adapter.events == [
         "load:custom",
         "synthesize:custom",
-        "unload:custom",
+        "cleanup",
         "load:custom",
         "synthesize:custom",
-        "unload:custom",
+        "cleanup",
     ]
     status = manager.status()
     assert status.state == WorkerState.ERROR
@@ -664,7 +681,7 @@ async def test_cancellation_during_first_load_oom_stops_before_retry(
     with pytest.raises(asyncio.CancelledError):
         await synthesis
 
-    assert fake_adapter.events == ["load:custom"]
+    assert fake_adapter.events == ["load:custom", "cleanup"]
     assert len(fake_adapter.load_calls) == 1
     assert manager.status().state == WorkerState.UNLOADED
 
@@ -683,7 +700,12 @@ async def test_cancellation_during_second_load_oom_commits_error_cooldown(
     with pytest.raises(asyncio.CancelledError):
         await synthesis
 
-    assert fake_adapter.events == ["load:custom", "load:custom"]
+    assert fake_adapter.events == [
+        "load:custom",
+        "cleanup",
+        "load:custom",
+        "cleanup",
+    ]
     assert len(fake_adapter.load_calls) == 2
     status = manager.status()
     assert status.state == WorkerState.ERROR
@@ -695,3 +717,16 @@ async def test_cancellation_during_second_load_oom_commits_error_cooldown(
         await manager.synthesize(custom_request())
     assert cooldown_error.value.code == "model_unavailable"
     assert fake_adapter.events == events_after_cancellation
+
+
+async def test_shutdown_releases_model_before_device_cleanup(
+    manager: QwenModelManager,
+    fake_adapter: FakeAdapter,
+) -> None:
+    await manager.synthesize(custom_request())
+
+    await manager.shutdown()
+
+    assert fake_adapter.events == ["load:custom", "synthesize:custom", "cleanup"]
+    assert fake_adapter.models_alive_during_cleanup == [[False]]
+    assert manager.status().loaded_model is None
