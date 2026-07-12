@@ -83,6 +83,16 @@ class QwenModelManager:
             last_error_code=self._last_error_code,
         )
 
+    def in_error_cooldown(self) -> bool:
+        if self._state != WorkerState.ERROR:
+            return False
+        if self._error_started_at is None:
+            raise AssertionError("ERROR state requires a cooldown start time")
+        return (
+            self._monotonic() - self._error_started_at
+            < self._settings.error_cooldown_seconds
+        )
+
     async def shutdown(self) -> None:
         async with self._gate.slot():
             checkpoint = _CancellationCheckpoint()
