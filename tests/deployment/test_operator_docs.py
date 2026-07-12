@@ -37,6 +37,56 @@ def test_readme_documents_complete_uv_locked_operator_workflow() -> None:
     assert not re.search(r"\b(?:pip(?:3)? install|poetry|conda)\b", readme, re.IGNORECASE)
 
 
+def test_readme_enumerates_public_error_codes() -> None:
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    public_error_codes = {
+        "invalid_audio": "400",
+        "unauthorized": "401",
+        "not_found": "404",
+        "voice_not_found": "404",
+        "method_not_allowed": "405",
+        "audio_too_large": "413",
+        "request_too_large": "413",
+        "validation_error": "422",
+        "unsupported_language": "422",
+        "consent_required": "422",
+        "invalid_audio_duration": "422",
+        "invalid_multipart": "422",
+        "queue_full": "429",
+        "internal_error": "500",
+        "backend_not_configured": "503",
+        "backend_unavailable": "503",
+        "backend_invalid_response": "503",
+        "worker_not_ready": "503",
+        "insufficient_vram": "503",
+        "model_load_failed": "503",
+        "model_unavailable": "503",
+        "cuda_out_of_memory": "503",
+        "queue_timeout": "504",
+        "backend_timeout": "504",
+        "backend_error": "Upstream status",
+        "http_error": "Other framework status",
+    }
+    for code, status in public_error_codes.items():
+        row = rf"(?m)^\| {re.escape(status)} \| `{code}` \| \S.* \|$"
+        assert re.search(row, readme), f"Missing documented mapping for {code}"
+
+
+def test_readme_has_explicit_sudo_preparation_command() -> None:
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+
+    sudo_command_fragments = (
+        "sudo env",
+        'TTS_UID="$TTS_UID"',
+        'TTS_GID="$TTS_GID"',
+        'TTS_HF_CACHE_DIR="$TTS_HF_CACHE_DIR"',
+        'TTS_SUPERTONIC_CACHE_DIR="$TTS_SUPERTONIC_CACHE_DIR"',
+        'TTS_DATA_DIR="$TTS_DATA_DIR"',
+        "./scripts/prepare-host.sh",
+    )
+    assert all(fragment in readme for fragment in sudo_command_fragments)
+
+
 def test_license_notes_cover_qwen_and_both_supertonic_licenses() -> None:
     licenses = (ROOT / "LICENSES.md").read_text(encoding="utf-8")
 

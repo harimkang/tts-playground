@@ -215,6 +215,47 @@ def test_run_benchmark_records_http_errors_and_continues(tmp_path: Path) -> None
     assert not list((tmp_path / "audio").glob("*.wav"))
 
 
+@pytest.mark.parametrize(
+    ("exception_type", "expected_error_code"),
+    [
+        (httpx.ConnectError, "request_error"),
+        (httpx.ReadTimeout, "request_timeout"),
+    ],
+)
+def test_run_benchmark_records_request_failures_and_continues_subsequent_attempts(
+    tmp_path: Path,
+    exception_type: type[httpx.RequestError],
+    expected_error_code: str,
+) -> None:
+    audio = _wav_bytes()
+    call_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise exception_type("injected request failure", request=request)
+        return httpx.Response(200, content=audio, headers={"Content-Type": "audio/wav"})
+
+    case = benchmark.BenchmarkCase("short", "안녕하세요.", "ko", None)
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        rows = benchmark.run_benchmark(
+            cases=[case],
+            client=client,
+            base_url="http://tts.example",
+            output_directory=tmp_path,
+            timestamp="2026-07-12T00:00:00Z",
+        )
+
+    assert call_count == 6
+    assert len(rows) == 6
+    assert rows[0]["status"] == 0
+    assert rows[0]["error_code"] == expected_error_code
+    assert all(row["status"] == 200 for row in rows[1:])
+    assert all(row["error_code"] is None for row in rows[1:])
+    assert len(list((tmp_path / "audio").glob("*.wav"))) == 5
+
+
 def test_write_results_uses_required_csv_columns(tmp_path: Path) -> None:
     row = {
         "timestamp": "2026-07-12T00:00:00Z",

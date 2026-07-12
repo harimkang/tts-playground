@@ -33,7 +33,19 @@ set +a
 ./scripts/generate-api-key.sh
 ```
 
-`prepare-host.sh` creates the configured cache and data directories with the numeric `TTS_UID:TTS_GID`. If `/srv` requires administrator access, rerun that preparation command with the environment preserved. `generate-api-key.sh` creates `secrets/tts_api_key.txt` once, with mode `0600`, and refuses to overwrite it.
+`prepare-host.sh` creates the configured cache and data directories with the numeric `TTS_UID:TTS_GID`. If it reports that `/srv` requires administrator access, use this complete command after loading `.env` as shown above; it explicitly passes every ownership and path setting through `sudo`:
+
+```sh
+sudo env \
+  TTS_UID="$TTS_UID" \
+  TTS_GID="$TTS_GID" \
+  TTS_HF_CACHE_DIR="$TTS_HF_CACHE_DIR" \
+  TTS_SUPERTONIC_CACHE_DIR="$TTS_SUPERTONIC_CACHE_DIR" \
+  TTS_DATA_DIR="$TTS_DATA_DIR" \
+  ./scripts/prepare-host.sh
+```
+
+`generate-api-key.sh` creates `secrets/tts_api_key.txt` once, with mode `0600`, and refuses to overwrite it.
 
 Build every image from the frozen lock, then prefetch the exact three Qwen repositories into the mounted Hugging Face cache:
 
@@ -175,18 +187,36 @@ curl --fail --silent --show-error -X DELETE \
 
 ## Errors and Qwen switching
 
-JSON errors contain `error.code`, a safe message, and `request_id`:
+JSON errors contain `error.code`, a safe message, and `request_id`. The public codes implemented by the gateway and the errors it safely forwards from its private workers are:
 
-| HTTP | Typical meaning and codes |
-| ---: | --- |
-| 400 | Malformed/unsupported audio (`invalid_audio`) |
-| 401 | Missing or invalid bearer token (`unauthorized`) |
-| 404 | Unknown endpoint or voice (`not_found`, `voice_not_found`) |
-| 413 | Upload/request too large (`audio_too_large`, `request_too_large`) |
-| 422 | Schema, model option, language, consent, or duration validation failure |
-| 429 | Qwen waiting queue is full (`queue_full`) |
-| 503 | Backend unavailable, insufficient VRAM, model load/inference failure, or cooldown |
-| 504 | Queue or backend/model operation timeout (`queue_timeout`, `backend_timeout`) |
+| HTTP | Code | Operator meaning |
+| ---: | --- | --- |
+| 400 | `invalid_audio` | Reference audio cannot be decoded or is not WAV/FLAC. Replace the upload. |
+| 401 | `unauthorized` | The bearer token is missing, malformed, or incorrect. |
+| 404 | `not_found` | The public route/resource does not exist. |
+| 404 | `voice_not_found` | The supplied registered voice ID does not exist. List voices and retry with a current ID. |
+| 405 | `method_not_allowed` | The route exists but does not accept that HTTP method. |
+| 413 | `audio_too_large` | Reference audio exceeds 20 MB. |
+| 413 | `request_too_large` | The complete multipart request exceeds its bounded size. |
+| 422 | `validation_error` | JSON/form data or model-specific fields fail public schema validation. |
+| 422 | `unsupported_language` | The selected backend does not support the requested language code. |
+| 422 | `consent_required` | Voice registration did not attest `consent_confirmed=true`. |
+| 422 | `invalid_audio_duration` | Reference audio is shorter than 3 seconds or longer than 30 seconds. |
+| 422 | `invalid_multipart` | Voice-registration multipart content type, boundary, or byte stream is malformed. |
+| 429 | `queue_full` | Three Qwen requests are already waiting by default; retry with backoff. |
+| 500 | `internal_error` | The Qwen worker encountered an unexpected internal failure; inspect its privacy-safe logs. |
+| 503 | `backend_not_configured` | A gateway was started without a backend router; this indicates deployment/configuration failure. |
+| 503 | `backend_unavailable` | A required private worker cannot be reached; check container status and networks. |
+| 503 | `backend_invalid_response` | A worker returned malformed discovery/voice JSON or a non-WAV synthesis payload. Inspect worker logs. |
+| 503 | `worker_not_ready` | The Qwen process is alive but its runtime manager/voice registry is not ready yet. |
+| 503 | `insufficient_vram` | Free VRAM is below `QWEN_MIN_FREE_VRAM_BYTES`; leave the existing GPU workload untouched and retry later. |
+| 503 | `model_load_failed` | The requested Qwen checkpoint could not be loaded; inspect Qwen logs/cache integrity. |
+| 503 | `model_unavailable` | Qwen is inside its error-recovery cooldown; wait for the configured cooldown. |
+| 503 | `cuda_out_of_memory` | Qwen exhausted GPU memory after its one cleanup/retry cycle. Reduce competing VRAM pressure without stopping `llama-server`. |
+| 504 | `queue_timeout` | A Qwen request waited longer than `QWEN_QUEUE_TIMEOUT_SECONDS`. |
+| 504 | `backend_timeout` | The gateway's private-worker request exceeded its configured timeout. |
+| Upstream status | `backend_error` | A worker returned an error without a valid structured envelope; use `request_id` to correlate gateway/worker logs. |
+| Other framework status | `http_error` | A framework HTTP error did not match the explicit 404/405 mappings. |
 
 The first Qwen call loads its checkpoint. A call for a different Qwen public model ID synchronously unloads the resident checkpoint and loads the requested one, so it can be much slower than a warm call. The default queue wait is 180 seconds and gateway Qwen timeout is 360 seconds. Do not interpret an unloaded Qwen state as unhealthy: `/readyz` means it can accept a load request.
 
