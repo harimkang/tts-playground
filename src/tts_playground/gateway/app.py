@@ -5,7 +5,6 @@ from typing import Annotated, Protocol, runtime_checkable
 from fastapi import Depends, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from starlette.exceptions import HTTPException
 from starlette.responses import Response
 
@@ -23,6 +22,7 @@ from tts_playground.common.settings import GatewaySettings
 from tts_playground.gateway.auth import read_api_key, require_api_key
 from tts_playground.gateway.backends import AudioResult
 from tts_playground.gateway.metrics import GatewayMetrics
+from tts_playground.gateway.routes import create_management_router
 from tts_playground.gateway.schemas import SpeechRequest
 
 RequestHandler = Callable[[Request], Awaitable[Response]]
@@ -89,14 +89,7 @@ def create_gateway_app(settings: GatewaySettings, backend_router: object | None)
     async def health() -> dict[str, str]:
         return {"status": "ok"}
 
-    @app.get("/metrics")
-    async def prometheus_metrics(
-        _authenticated: Annotated[None, Depends(authenticate)],
-    ) -> Response:
-        return Response(
-            content=generate_latest(metrics.registry),
-            headers={"Content-Type": CONTENT_TYPE_LATEST},
-        )
+    app.include_router(create_management_router(backend_router, authenticate, metrics))
 
     @app.post("/v1/audio/speech")
     async def speech(
