@@ -63,7 +63,15 @@ def test_networks_keep_workers_private_with_model_egress(
     services = compose_config["services"]
 
     assert compose_config["networks"]["tts-private"]["internal"] is True
-    assert set(services["tts-gateway"]["networks"]) == {"tts-private"}
+    gateway_ingress = compose_config["networks"]["gateway-ingress"]
+    assert gateway_ingress.get("internal", False) is False
+    assert gateway_ingress["driver_opts"] == {
+        "com.docker.network.bridge.enable_ip_masquerade": "false"
+    }
+    assert set(services["tts-gateway"]["networks"]) == {
+        "gateway-ingress",
+        "tts-private",
+    }
     assert set(services["qwen-worker"]["networks"]) == {"tts-private", "model-egress"}
     assert set(services["supertonic-worker"]["networks"]) == {
         "tts-private",
@@ -98,6 +106,20 @@ def test_qwen_mounts_model_cache_and_voice_data(compose_config: dict[str, Any]) 
 
     assert ("/srv/tts-cache/huggingface", "/cache/huggingface") in writable_bind_mounts
     assert ("/srv/tts-data", "/data") in writable_bind_mounts
+
+
+def test_supertonic_mounts_the_writable_cache_parent(
+    compose_config: dict[str, Any],
+) -> None:
+    volumes = compose_config["services"]["supertonic-worker"]["volumes"]
+
+    assert volumes == [
+        {
+            "type": "bind",
+            "source": "/srv/tts-cache/supertonic",
+            "target": "/home/app/.cache",
+        }
+    ]
 
 
 def test_services_apply_runtime_hardening(compose_config: dict[str, Any]) -> None:
@@ -177,6 +199,19 @@ def test_uv_images_pin_and_cache_the_project_build_backend_before_offline_sync()
         )
 
 
+def test_qwen_lock_pins_a_python_312_compatible_numba_stack() -> None:
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    qwen_dependencies = set(project["project"]["optional-dependencies"]["qwen"])
+
+    assert "numba==0.66.0" in qwen_dependencies
+    assert "llvmlite==0.48.0" in qwen_dependencies
+
+    lock = tomllib.loads((ROOT / "uv.lock").read_text(encoding="utf-8"))
+    locked_versions = {package["name"]: package["version"] for package in lock["package"]}
+    assert locked_versions["numba"] == "0.66.0"
+    assert locked_versions["llvmlite"] == "0.48.0"
+
+
 def test_python_images_use_uv_managed_frozen_environments() -> None:
     project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     assert project["project"]["optional-dependencies"]["supertonic"] == [
@@ -219,6 +254,17 @@ def test_gateway_uv_runtime_cache_is_writable_under_hardened_compose(
     assert "HOME=/tmp" in dockerfile
     assert "UV_CACHE_DIR=/tmp/uv-cache" in dockerfile
     assert '["uv", "run", "--no-sync", "uvicorn"' in dockerfile
+
+
+def test_qwen_torch_cache_uses_writable_tmpfs_without_passwd_lookup(
+    compose_config: dict[str, Any],
+) -> None:
+    qwen = compose_config["services"]["qwen-worker"]
+
+    assert qwen["environment"]["HF_HOME"] == "/cache/huggingface"
+    assert qwen["environment"]["HF_HUB_CACHE"] == "/cache/huggingface"
+    assert qwen["environment"]["TORCHINDUCTOR_CACHE_DIR"] == "/tmp/torchinductor"
+    assert "/tmp" in qwen["tmpfs"]
 
 
 def test_gateway_container_probe_uses_compose_hardening() -> None:

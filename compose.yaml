@@ -37,6 +37,7 @@ services:
         condition: service_healthy
     networks:
       - tts-private
+      - gateway-ingress
     restart: unless-stopped
     init: true
     read_only: true
@@ -69,6 +70,7 @@ services:
       - "8001"
     user: "${TTS_UID}:${TTS_GID}"
     environment:
+      HF_HUB_CACHE: /cache/huggingface
       HF_HOME: /cache/huggingface
       HOME: /tmp
       QWEN_MAX_WAITING: "${QWEN_MAX_WAITING}"
@@ -78,6 +80,7 @@ services:
       QWEN_ERROR_COOLDOWN_SECONDS: "${QWEN_ERROR_COOLDOWN_SECONDS}"
       QWEN_ATTENTION_IMPLEMENTATION: "${QWEN_ATTENTION_IMPLEMENTATION}"
       QWEN_VOICE_DATA_DIR: /data/voices
+      TORCHINDUCTOR_CACHE_DIR: /tmp/torchinductor
     volumes:
       - type: bind
         source: "${TTS_HF_CACHE_DIR}"
@@ -131,7 +134,7 @@ services:
     volumes:
       - type: bind
         source: "${TTS_SUPERTONIC_CACHE_DIR}"
-        target: /home/app/.cache/supertonic3
+        target: /home/app/.cache
     networks:
       - tts-private
       - model-egress
@@ -154,6 +157,9 @@ services:
 networks:
   tts-private:
     internal: true
+  gateway-ingress:
+    driver_opts:
+      com.docker.network.bridge.enable_ip_masquerade: "false"
   model-egress: {}
 
 secrets:
