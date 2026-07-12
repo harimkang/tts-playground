@@ -30,4 +30,6 @@ RUN uv sync --frozen --no-dev --extra build --extra qwen --no-install-project
 COPY src ./src
 RUN uv sync --frozen --no-dev --extra build --extra qwen --no-build-isolation --offline
 
+COPY scripts/prefetch-models.py ./scripts/prefetch-models.py
+
 CMD ["uv", "run", "uvicorn", "tts_playground.qwen.app:app", "--host", "0.0.0.0", "--port", "8001"]

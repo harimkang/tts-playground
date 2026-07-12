@@ -230,3 +230,14 @@ def test_gateway_container_probe_uses_compose_hardening() -> None:
     assert "run --no-deps --rm" in probe
     assert "uv run --no-sync" in probe
     assert "import tts_playground.gateway.app" in probe
+
+
+def test_qwen_image_copies_prefetch_script_after_frozen_dependency_install() -> None:
+    dockerfile = (ROOT / "docker" / "qwen.Dockerfile").read_text(encoding="utf-8")
+    final_sync = (
+        "uv sync --frozen --no-dev --extra build --extra qwen "
+        "--no-build-isolation --offline"
+    )
+    copy_prefetch = "COPY scripts/prefetch-models.py ./scripts/prefetch-models.py"
+
+    assert dockerfile.index(final_sync) < dockerfile.index(copy_prefetch)
