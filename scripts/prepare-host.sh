@@ -14,17 +14,14 @@ case "$TTS_UID:$TTS_GID" in
         ;;
 esac
 
-directories="$TTS_HF_CACHE_DIR
-$TTS_SUPERTONIC_CACHE_DIR
-$TTS_DATA_DIR"
-
 rerun_with_sudo() {
     echo "Unable to prepare directories under /srv as the current user." >&2
     echo "Rerun this script under sudo with TTS_UID and TTS_GID preserved." >&2
     exit 1
 }
 
-for directory in $directories; do
+prepare_directory() {
+    directory=$1
     if [ ! -d "$directory" ] && ! mkdir -p "$directory" 2>/dev/null; then
         rerun_with_sudo
     fi
@@ -38,9 +35,10 @@ for directory in $directories; do
         chown "$TTS_UID:$TTS_GID" "$directory"
     fi
     chmod 0750 "$directory"
-done
+}
 
-for directory in $directories; do
+verify_directory() {
+    directory=$1
     if [ "$(id -u)" -eq "$TTS_UID" ]; then
         test -w "$directory" || {
             echo "$directory is not writable by UID $TTS_UID." >&2
@@ -59,6 +57,14 @@ for directory in $directories; do
     else
         rerun_with_sudo
     fi
-done
+}
+
+prepare_directory "$TTS_HF_CACHE_DIR"
+prepare_directory "$TTS_SUPERTONIC_CACHE_DIR"
+prepare_directory "$TTS_DATA_DIR"
+
+verify_directory "$TTS_HF_CACHE_DIR"
+verify_directory "$TTS_SUPERTONIC_CACHE_DIR"
+verify_directory "$TTS_DATA_DIR"
 
 echo "Host cache and data directories are ready for UID:GID $TTS_UID:$TTS_GID."

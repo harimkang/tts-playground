@@ -140,22 +140,41 @@ def test_healthchecks_use_python_and_gateway_waits_for_workers(
 def test_uv_images_pin_and_cache_the_project_build_backend_before_offline_sync() -> None:
     project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     assert project["build-system"]["requires"] == ["hatchling==1.31.0"]
+    assert project["project"]["optional-dependencies"]["build"] == [
+        "hatchling==1.31.0",
+        "editables==0.5",
+    ]
 
-    expected_steps = (
-        "COPY pyproject.toml uv.lock ./",
-        "uv sync --frozen --no-dev",
-        "uv pip install --target /tmp/hatchling-cache-warm",
-        '"hatchling==1.31.0"',
-        '"editables==0.5"',
-        "COPY src ./src",
-        "uv sync --frozen --no-dev",
-        "--offline",
-    )
-    for dockerfile_name in ("gateway.Dockerfile", "qwen.Dockerfile"):
+    lock = tomllib.loads((ROOT / "uv.lock").read_text(encoding="utf-8"))
+    locked_versions = {package["name"]: package["version"] for package in lock["package"]}
+    assert locked_versions["hatchling"] == "1.31.0"
+    assert locked_versions["editables"] == "0.5"
+
+    expected_first_sync = {
+        "gateway.Dockerfile": (
+            "uv sync --frozen --no-dev --extra build --no-install-project"
+        ),
+        "qwen.Dockerfile": (
+            "uv sync --frozen --no-dev --extra build --extra qwen --no-install-project"
+        ),
+    }
+    expected_final_sync = {
+        "gateway.Dockerfile": (
+            "uv sync --frozen --no-dev --extra build "
+            "--no-build-isolation --offline"
+        ),
+        "qwen.Dockerfile": (
+            "uv sync --frozen --no-dev --extra build --extra qwen "
+            "--no-build-isolation --offline"
+        ),
+    }
+    for dockerfile_name, first_sync in expected_first_sync.items():
         dockerfile = (ROOT / "docker" / dockerfile_name).read_text(encoding="utf-8")
-        cursor = 0
-        for step in expected_steps:
-            cursor = dockerfile.index(step, cursor) + len(step)
+        assert "uv pip" not in dockerfile
+        assert dockerfile.index(first_sync) < dockerfile.index("COPY src ./src")
+        assert dockerfile.index("COPY src ./src") < dockerfile.index(
+            expected_final_sync[dockerfile_name]
+        )
 
 
 def test_python_images_use_uv_managed_frozen_environments() -> None:
@@ -180,8 +199,34 @@ def test_python_images_use_uv_managed_frozen_environments() -> None:
         assert "uv sync --frozen --no-dev" in dockerfile
         assert ".venv" in dockerfile
 
-    assert "uv sync --frozen --no-dev --extra qwen" in dockerfiles["qwen.Dockerfile"]
+    assert "--extra qwen" in dockerfiles["qwen.Dockerfile"]
     assert (
         "uv sync --frozen --no-dev --extra supertonic --no-install-project"
         in dockerfiles["supertonic.Dockerfile"]
     )
+
+
+def test_gateway_uv_runtime_cache_is_writable_under_hardened_compose(
+    compose_config: dict[str, Any],
+) -> None:
+    gateway = compose_config["services"]["tts-gateway"]
+
+    assert gateway["environment"]["HOME"] == "/tmp"
+    assert gateway["environment"]["UV_CACHE_DIR"] == "/tmp/uv-cache"
+    assert gateway["command"][:3] == ["uv", "run", "--no-sync"]
+
+    dockerfile = (ROOT / "docker" / "gateway.Dockerfile").read_text(encoding="utf-8")
+    assert "HOME=/tmp" in dockerfile
+    assert "UV_CACHE_DIR=/tmp/uv-cache" in dockerfile
+    assert '["uv", "run", "--no-sync", "uvicorn"' in dockerfile
+
+
+def test_gateway_container_probe_uses_compose_hardening() -> None:
+    probe = (ROOT / "scripts" / "probe-gateway-container.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert "docker compose" in probe
+    assert "run --no-deps --rm" in probe
+    assert "uv run --no-sync" in probe
+    assert "import tts_playground.gateway.app" in probe

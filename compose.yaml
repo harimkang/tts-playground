@@ -7,6 +7,7 @@ services:
     command:
       - uv
       - run
+      - --no-sync
       - uvicorn
       - tts_playground.gateway.app:app
       - --host
@@ -15,10 +16,12 @@ services:
       - "8020"
     user: "${TTS_UID}:${TTS_GID}"
     environment:
+      HOME: /tmp
       TTS_API_KEY_FILE: /run/secrets/tts_api_key
       TTS_PUBLIC_PORT: "8020"
       TTS_QWEN_URL: http://qwen-worker:8001
       TTS_SUPERTONIC_URL: http://supertonic-worker:7788
+      UV_CACHE_DIR: /tmp/uv-cache
     secrets:
       - source: tts_api_key
         target: /run/secrets/tts_api_key

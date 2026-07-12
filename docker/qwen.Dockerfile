@@ -25,13 +25,9 @@ COPY --from=ghcr.io/astral-sh/uv:0.11.14 /uv /uvx /bin/
 WORKDIR /app
 
 COPY pyproject.toml uv.lock ./
-RUN uv sync --frozen --no-dev --extra qwen --no-install-project \
-    && uv pip install --target /tmp/hatchling-cache-warm \
-        "hatchling==1.31.0" \
-        "editables==0.5" \
-    && rm -rf /tmp/hatchling-cache-warm
+RUN uv sync --frozen --no-dev --extra build --extra qwen --no-install-project
 
 COPY src ./src
-RUN uv sync --frozen --no-dev --extra qwen --offline
+RUN uv sync --frozen --no-dev --extra build --extra qwen --no-build-isolation --offline
 
 CMD ["uv", "run", "uvicorn", "tts_playground.qwen.app:app", "--host", "0.0.0.0", "--port", "8001"]
