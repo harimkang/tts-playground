@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import io
 import re
 import threading
@@ -7,6 +8,7 @@ import time
 import warnings
 from pathlib import Path
 
+import httpx
 import numpy as np
 import pytest
 import soundfile as sf
@@ -27,8 +29,14 @@ class FakeAdapter:
     def __init__(self) -> None:
         self.free_vram = 12 * 1024**3
         self.load_error: BaseException | None = None
+        self.build_error: BaseException | None = None
         self.synthesis_error: BaseException | None = None
         self.synthesis_requests: list[InternalSpeechRequest] = []
+        self.build_calls: list[tuple[Path, str | None]] = []
+        self.paths_existing_during_build: list[bool] = []
+        self.block_build = False
+        self.build_started = threading.Event()
+        self.release_build = threading.Event()
         self.device_memory_cleaned = threading.Event()
         self.audio = _wav_bytes(duration_seconds=1.25, sample_rate=16_000)
 
@@ -49,6 +57,14 @@ class FakeAdapter:
         audio_path: Path,
         transcript: str | None,
     ) -> object:
+        self.build_calls.append((audio_path, transcript))
+        self.paths_existing_during_build.append(audio_path.exists())
+        if self.block_build:
+            self.build_started.set()
+            if not self.release_build.wait(timeout=2.0):
+                raise AssertionError("test did not release blocked prompt build")
+        if self.build_error is not None:
+            raise self.build_error
         return (str(audio_path), transcript)
 
     def synthesize(
@@ -89,6 +105,25 @@ def _speech_body() -> dict[str, object]:
         "language": "Korean",
         "voice": "Sohee",
         "instructions": "차분하게",
+    }
+
+
+def _clone_form(**updates: str) -> dict[str, str]:
+    form = {
+        "input": "새로 합성할 문장",
+        "consent_confirmed": "true",
+        "transcript": "exact text",
+        "language": "auto",
+        "response_format": "wav",
+    }
+    form.update(updates)
+    return form
+
+
+def _registry_files(voice_data_dir: Path) -> set[Path]:
+    return {
+        path.relative_to(voice_data_dir)
+        for path in voice_data_dir.rglob("*")
     }
 
 
@@ -257,6 +292,260 @@ def test_normalized_worker_method_error_preserves_allow_header(tmp_path: Path) -
     assert response.status_code == 405
     assert response.headers["Allow"] == "POST"
     assert response.json()["error"]["code"] == "method_not_allowed"
+
+
+def test_ephemeral_clone_returns_wav_without_persisting_reference(tmp_path: Path) -> None:
+    adapter = FakeAdapter()
+    settings = _settings(tmp_path)
+    app = create_qwen_app(settings, adapter)
+    client_filename = "PRIVATE_CLIENT_FILENAME.wav"
+
+    with TestClient(app) as client:
+        registry_before = app.state.voice_registry.list_public()
+        files_before = _registry_files(settings.voice_data_dir)
+        response = client.post(
+            "/internal/v1/speech/clone",
+            data=_clone_form(),
+            files={"audio": (client_filename, _wav_bytes(), "audio/wav")},
+        )
+        registry_after = app.state.voice_registry.list_public()
+        files_after = _registry_files(settings.voice_data_dir)
+
+    assert response.status_code == 200
+    assert response.content == adapter.audio
+    assert response.headers["content-type"] == "audio/wav"
+    assert response.headers["x-tts-model"] == ModelID.QWEN_CLONE
+    assert response.headers["x-input-chars"] == str(len("새로 합성할 문장"))
+    assert adapter.synthesis_requests == [
+        InternalSpeechRequest(
+            model=ModelID.QWEN_CLONE,
+            text="새로 합성할 문장",
+            language="Auto",
+            voice=None,
+            instructions=None,
+        )
+    ]
+    assert len(adapter.build_calls) == 1
+    temporary_path, transcript = adapter.build_calls[0]
+    assert transcript == "exact text"
+    assert adapter.paths_existing_during_build == [True]
+    assert temporary_path.name == "reference.wav"
+    assert temporary_path.parent.name.startswith("qwen-clone-")
+    assert client_filename not in str(temporary_path)
+    assert not temporary_path.exists()
+    assert registry_before == registry_after == []
+    assert files_before == files_after
+
+
+@pytest.mark.parametrize(
+    "transcript",
+    [
+        pytest.param(None, id="omitted"),
+        pytest.param("", id="empty"),
+        pytest.param("   ", id="whitespace"),
+    ],
+)
+def test_ephemeral_clone_normalizes_blank_transcript(
+    tmp_path: Path,
+    transcript: str | None,
+) -> None:
+    adapter = FakeAdapter()
+    app = create_qwen_app(_settings(tmp_path), adapter)
+    form = _clone_form()
+    if transcript is None:
+        form.pop("transcript")
+    else:
+        form["transcript"] = transcript
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/internal/v1/speech/clone",
+            data=form,
+            files={"audio": ("reference.wav", _wav_bytes(), "audio/wav")},
+        )
+
+    assert response.status_code == 200
+    assert len(adapter.build_calls) == 1
+    temporary_path, normalized_transcript = adapter.build_calls[0]
+    assert normalized_transcript is None
+    assert not temporary_path.exists()
+
+
+@pytest.mark.parametrize(
+    ("form_updates", "audio", "expected_status", "expected_code"),
+    [
+        pytest.param(
+            {"language": "ar"},
+            _wav_bytes(),
+            422,
+            "unsupported_language",
+            id="unsupported-language",
+        ),
+        pytest.param(
+            {"consent_confirmed": "false"},
+            _wav_bytes(),
+            422,
+            "consent_required",
+            id="false-consent",
+        ),
+        pytest.param(
+            {"response_format": "mp3"},
+            _wav_bytes(),
+            422,
+            "validation_error",
+            id="response-format",
+        ),
+        pytest.param({}, b"not audio", 400, "invalid_audio", id="invalid-audio"),
+        pytest.param(
+            {},
+            b"x" * (20 * 1024 * 1024 + 1),
+            413,
+            "audio_too_large",
+            id="oversized-audio",
+        ),
+    ],
+)
+def test_ephemeral_clone_rejects_invalid_requests_before_prompt_build(
+    tmp_path: Path,
+    form_updates: dict[str, str],
+    audio: bytes,
+    expected_status: int,
+    expected_code: str,
+) -> None:
+    adapter = FakeAdapter()
+    app = create_qwen_app(_settings(tmp_path), adapter)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/internal/v1/speech/clone",
+            data=_clone_form(**form_updates),
+            files={"audio": ("private-name.wav", audio, "audio/wav")},
+        )
+
+    assert response.status_code == expected_status
+    assert response.json()["error"]["code"] == expected_code
+    assert adapter.build_calls == []
+
+
+def test_ephemeral_clone_requires_consent_before_prompt_build(tmp_path: Path) -> None:
+    adapter = FakeAdapter()
+    app = create_qwen_app(_settings(tmp_path), adapter)
+    form = _clone_form()
+    form.pop("consent_confirmed")
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/internal/v1/speech/clone",
+            data=form,
+            files={"audio": ("private-name.wav", _wav_bytes(), "audio/wav")},
+        )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "validation_error"
+    assert adapter.build_calls == []
+
+
+@pytest.mark.parametrize("failure_stage", ["build", "synthesis"])
+def test_ephemeral_clone_removes_temporary_audio_after_adapter_failure(
+    tmp_path: Path,
+    failure_stage: str,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    marker = "PRIVATE_CLONE_EXCEPTION_MARKER"
+    adapter = FakeAdapter()
+    if failure_stage == "build":
+        adapter.build_error = RuntimeError(marker)
+    else:
+        adapter.synthesis_error = RuntimeError(marker)
+    app = create_qwen_app(_settings(tmp_path), adapter)
+    private_values = (
+        "PRIVATE_CLONE_INPUT",
+        "PRIVATE_CLONE_TRANSCRIPT",
+        "PRIVATE_CLIENT_FILENAME.wav",
+        marker,
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/internal/v1/speech/clone",
+            data=_clone_form(
+                input=private_values[0],
+                transcript=private_values[1],
+            ),
+            files={"audio": (private_values[2], _wav_bytes(), "audio/wav")},
+        )
+
+    assert response.status_code == 500
+    assert response.json()["error"]["code"] == "internal_error"
+    assert len(adapter.build_calls) == 1
+    assert not adapter.build_calls[0][0].exists()
+    captured = capsys.readouterr()
+    public_output = response.text + caplog.text + captured.out + captured.err
+    assert all(value not in public_output for value in private_values)
+
+
+async def test_ephemeral_clone_cancellation_waits_for_build_before_cleanup(
+    tmp_path: Path,
+) -> None:
+    adapter = FakeAdapter()
+    adapter.block_build = True
+    app = create_qwen_app(_settings(tmp_path), adapter)
+    transport = httpx.ASGITransport(app=app)
+
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            request_task = asyncio.create_task(
+                client.post(
+                    "/internal/v1/speech/clone",
+                    data=_clone_form(),
+                    files={"audio": ("private.wav", _wav_bytes(), "audio/wav")},
+                )
+            )
+            assert await asyncio.to_thread(adapter.build_started.wait, 1.0)
+            temporary_path = adapter.build_calls[0][0]
+            assert temporary_path.exists()
+
+            request_task.cancel()
+            await asyncio.sleep(0)
+            assert not request_task.done()
+            assert temporary_path.exists()
+
+            adapter.release_build.set()
+            with pytest.raises(asyncio.CancelledError):
+                await request_task
+            assert not temporary_path.exists()
+
+
+def test_ephemeral_clone_metrics_record_success_and_sanitized_failure(tmp_path: Path) -> None:
+    adapter = FakeAdapter()
+    app = create_qwen_app(_settings(tmp_path), adapter)
+
+    with TestClient(app) as client:
+        success = client.post(
+            "/internal/v1/speech/clone",
+            data=_clone_form(),
+            files={"audio": ("reference.wav", _wav_bytes(), "audio/wav")},
+        )
+        adapter.synthesis_error = RuntimeError("PRIVATE_METRICS_MARKER")
+        failure = client.post(
+            "/internal/v1/speech/clone",
+            data=_clone_form(),
+            files={"audio": ("reference.wav", _wav_bytes(), "audio/wav")},
+        )
+        metrics = client.get("/metrics")
+
+    assert success.status_code == 200
+    assert failure.status_code == 500
+    assert (
+        'tts_qwen_requests_total{model="qwen3-tts-1.7b-clone",status="200"} 1.0'
+        in metrics.text
+    )
+    assert (
+        'tts_qwen_requests_total{model="qwen3-tts-1.7b-clone",status="500"} 1.0'
+        in metrics.text
+    )
+    assert 'tts_qwen_errors_total{code="internal_error"} 1.0' in metrics.text
 
 
 def test_voice_registration_list_detail_and_delete(tmp_path: Path) -> None:

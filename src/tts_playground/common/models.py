@@ -1,4 +1,5 @@
 from enum import StrEnum
+from typing import Final
 
 
 class ModelID(StrEnum):
@@ -19,6 +20,21 @@ QWEN_CUSTOM_SPEAKERS = (
     "Ono_Anna",
     "Sohee",
 )
+
+
+QWEN_LANGUAGES: Final = {
+    "auto": "Auto",
+    "zh": "Chinese",
+    "en": "English",
+    "ja": "Japanese",
+    "ko": "Korean",
+    "de": "German",
+    "fr": "French",
+    "ru": "Russian",
+    "pt": "Portuguese",
+    "es": "Spanish",
+    "it": "Italian",
+}
 
 
 QWEN_REPOSITORIES: dict[ModelID, str] = {

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import tempfile
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from time import perf_counter
-from typing import Annotated, cast
+from typing import Annotated, Literal, cast
 
 from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
@@ -16,6 +17,7 @@ from starlette.responses import Response
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from tts_playground.common.errors import ServiceError
+from tts_playground.common.models import QWEN_LANGUAGES, ModelID
 from tts_playground.common.request_id import resolve_request_id
 from tts_playground.common.settings import QwenSettings
 from tts_playground.qwen.adapter import (
@@ -26,7 +28,10 @@ from tts_playground.qwen.adapter import (
 from tts_playground.qwen.manager import QwenModelManager
 from tts_playground.qwen.metrics import QwenMetrics
 from tts_playground.qwen.real_adapter import QwenTTSAdapter
-from tts_playground.qwen.reference_audio import normalize_optional_transcript
+from tts_playground.qwen.reference_audio import (
+    normalize_optional_transcript,
+    normalize_reference_audio,
+)
 from tts_playground.qwen.schemas import (
     QwenSpeechRequest,
     VoiceResponse,
@@ -35,6 +40,7 @@ from tts_playground.qwen.schemas import (
 from tts_playground.qwen.voice_registry import MAX_AUDIO_BYTES, VoiceRegistry
 
 RequestHandler = Callable[[Request], Awaitable[Response]]
+SynthesisOperation = Callable[[], Awaitable[SynthesisResult]]
 _UPLOAD_CHUNK_BYTES = 1024 * 1024
 
 
@@ -199,49 +205,69 @@ def create_qwen_app(settings: QwenSettings, adapter: QwenAdapter) -> FastAPI:
     @app.post("/internal/v1/speech")
     async def speech(request: Request, body: QwenSpeechRequest) -> Response:
         manager = _manager(request)
-        started_at = perf_counter()
-        model = body.model.value
-        try:
-            result = await manager.synthesize(body.to_internal())
-        except ServiceError as error:
-            elapsed_seconds = perf_counter() - started_at
-            metrics.record_request(
-                model=model,
-                status=error.status_code,
-                elapsed_seconds=elapsed_seconds,
-                audio_seconds=None,
-            )
-            metrics.record_error(error.code)
-            metrics.observe_status(manager.status())
-            raise
-        except Exception:
-            elapsed_seconds = perf_counter() - started_at
-            metrics.record_request(
-                model=model,
-                status=500,
-                elapsed_seconds=elapsed_seconds,
-                audio_seconds=None,
-            )
-            metrics.record_error("internal_error")
-            metrics.observe_status(manager.status())
-            raise
-
-        elapsed_seconds = perf_counter() - started_at
-        metrics.record_request(
-            model=model,
-            status=200,
-            elapsed_seconds=elapsed_seconds,
-            audio_seconds=result.duration_seconds,
+        result, elapsed_seconds = await _observe_synthesis(
+            manager,
+            metrics,
+            body.model,
+            lambda: manager.synthesize(body.to_internal()),
         )
-        metrics.observe_status(manager.status())
-        return Response(
-            content=result.audio,
-            headers={
-                "Content-Type": "audio/wav",
-                "X-TTS-Model": model,
-                "X-Audio-Duration": str(result.duration_seconds),
-                "X-Processing-Ms": f"{elapsed_seconds * 1000:.3f}",
-            },
+        return _synthesis_response(result, body.model, elapsed_seconds)
+
+    @app.post("/internal/v1/speech/clone")
+    async def ephemeral_clone(
+        request: Request,
+        input: Annotated[str, Form(min_length=1, max_length=2000)],
+        audio: Annotated[UploadFile, File()],
+        consent_confirmed: Annotated[bool, Form()],
+        transcript: Annotated[str | None, Form(max_length=4000)] = None,
+        language: Annotated[str, Form(min_length=2, max_length=10)] = "auto",
+        response_format: Annotated[Literal["wav"], Form()] = "wav",
+    ) -> Response:
+        manager = _manager(request)
+
+        async def synthesize_clone() -> SynthesisResult:
+            if not consent_confirmed:
+                raise ServiceError(
+                    status_code=422,
+                    code="consent_required",
+                    message="Consent confirmation is required.",
+                )
+            qwen_language = QWEN_LANGUAGES.get(language)
+            if qwen_language is None:
+                raise ServiceError(
+                    status_code=422,
+                    code="unsupported_language",
+                    message="Qwen does not support this language.",
+                )
+            audio_bytes = await _read_bounded_upload(audio)
+            normalized_transcript = normalize_optional_transcript(transcript)
+            with tempfile.TemporaryDirectory(prefix="qwen-clone-", dir="/tmp") as directory:
+                audio_path = Path(directory) / "reference.wav"
+                await asyncio.to_thread(normalize_reference_audio, audio_bytes, audio_path)
+                internal = InternalSpeechRequest(
+                    model=ModelID.QWEN_CLONE,
+                    text=input,
+                    language=qwen_language,
+                    voice=None,
+                    instructions=None,
+                )
+                return await manager.synthesize_ephemeral_clone(
+                    internal,
+                    audio_path,
+                    normalized_transcript,
+                )
+
+        result, elapsed_seconds = await _observe_synthesis(
+            manager,
+            metrics,
+            ModelID.QWEN_CLONE,
+            synthesize_clone,
+        )
+        return _synthesis_response(
+            result,
+            ModelID.QWEN_CLONE,
+            elapsed_seconds,
+            input_chars=len(input),
         )
 
     @app.post("/internal/v1/voices", status_code=201)
@@ -295,6 +321,67 @@ async def _read_bounded_upload(audio: UploadFile) -> bytes:
                 message="Reference audio exceeds the 20 MB limit.",
             )
     return bytes(content)
+
+
+async def _observe_synthesis(
+    manager: QwenModelManager,
+    metrics: QwenMetrics,
+    model: ModelID,
+    operation: SynthesisOperation,
+) -> tuple[SynthesisResult, float]:
+    started_at = perf_counter()
+    try:
+        result = await operation()
+    except ServiceError as error:
+        elapsed_seconds = perf_counter() - started_at
+        metrics.record_request(
+            model=model.value,
+            status=error.status_code,
+            elapsed_seconds=elapsed_seconds,
+            audio_seconds=None,
+        )
+        metrics.record_error(error.code)
+        metrics.observe_status(manager.status())
+        raise
+    except Exception:
+        elapsed_seconds = perf_counter() - started_at
+        metrics.record_request(
+            model=model.value,
+            status=500,
+            elapsed_seconds=elapsed_seconds,
+            audio_seconds=None,
+        )
+        metrics.record_error("internal_error")
+        metrics.observe_status(manager.status())
+        raise
+
+    elapsed_seconds = perf_counter() - started_at
+    metrics.record_request(
+        model=model.value,
+        status=200,
+        elapsed_seconds=elapsed_seconds,
+        audio_seconds=result.duration_seconds,
+    )
+    metrics.observe_status(manager.status())
+    return result, elapsed_seconds
+
+
+def _synthesis_response(
+    result: SynthesisResult,
+    model: ModelID,
+    elapsed_seconds: float,
+    *,
+    input_chars: int | None = None,
+) -> Response:
+    headers = {
+        "Content-Type": "audio/wav",
+        "X-TTS-Model": model.value,
+        "X-Audio-Duration": str(result.duration_seconds),
+        "X-Processing-Ms": f"{elapsed_seconds * 1000:.3f}",
+    }
+    if input_chars is not None:
+        headers["X-Input-Chars"] = str(min(max(input_chars, 0), 2000))
+    return Response(content=result.audio, headers=headers)
 
 
 async def _idle_unload_loop(

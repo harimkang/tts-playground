@@ -17,23 +17,9 @@ from tts_playground.common.logging import (
     normalize_bounded_nonnegative,
     normalize_error_code,
 )
-from tts_playground.common.models import ModelID
+from tts_playground.common.models import QWEN_LANGUAGES, ModelID
 from tts_playground.common.settings import GatewaySettings
 from tts_playground.gateway.schemas import SpeechRequest
-
-QWEN_LANGUAGES = {
-    "auto": "Auto",
-    "zh": "Chinese",
-    "en": "English",
-    "ja": "Japanese",
-    "ko": "Korean",
-    "de": "German",
-    "fr": "French",
-    "ru": "Russian",
-    "pt": "Portuguese",
-    "es": "Spanish",
-    "it": "Italian",
-}
 
 SUPERTONIC_LANGUAGES = {
     "en",

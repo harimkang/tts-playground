@@ -1,6 +1,7 @@
 import httpx
 import pytest
 
+from tts_playground.common import models as common_models
 from tts_playground.common.errors import ServiceError
 from tts_playground.common.settings import GatewaySettings
 from tts_playground.gateway.backends import (
@@ -12,6 +13,7 @@ from tts_playground.gateway.schemas import SpeechRequest
 
 
 def test_language_maps_are_explicit_and_complete() -> None:
+    assert QWEN_LANGUAGES is common_models.QWEN_LANGUAGES
     assert QWEN_LANGUAGES == {
         "auto": "Auto",
         "zh": "Chinese",
