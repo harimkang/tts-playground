@@ -9,7 +9,7 @@ from pathlib import Path
 from time import perf_counter
 from typing import Annotated, Literal, cast
 
-from fastapi import FastAPI, File, Form, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
@@ -236,7 +236,10 @@ def create_qwen_app(settings: QwenSettings, adapter: QwenAdapter) -> FastAPI:
         )
         return _synthesis_response(result, body.model, elapsed_seconds)
 
-    @app.post("/internal/v1/speech/clone")
+    @app.post(
+        "/internal/v1/speech/clone",
+        dependencies=[Depends(_validate_ephemeral_clone_fields)],
+    )
     async def ephemeral_clone(
         request: Request,
         input: Annotated[str, Form(min_length=1, max_length=2000)],
@@ -246,7 +249,6 @@ def create_qwen_app(settings: QwenSettings, adapter: QwenAdapter) -> FastAPI:
         language: Annotated[str, Form(min_length=2, max_length=10)] = "auto",
         response_format: Annotated[Literal["wav"], Form()] = "wav",
     ) -> Response:
-        await _validate_ephemeral_clone_fields(request)
         manager = _manager(request)
 
         async def synthesize_clone() -> SynthesisResult:

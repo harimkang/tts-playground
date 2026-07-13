@@ -619,6 +619,44 @@ def test_ephemeral_clone_rejects_duplicate_singular_fields_before_prompt_build(
     assert files_before == files_after
 
 
+@pytest.mark.parametrize(
+    ("field_name", "invalid_part"),
+    [
+        pytest.param("response_format", (None, "mp3"), id="response-format"),
+        pytest.param(
+            "consent_confirmed",
+            (None, "not-a-boolean"),
+            id="consent-confirmed",
+        ),
+        pytest.param("input", (None, "x" * 2001), id="input-length"),
+    ],
+)
+def test_ephemeral_clone_duplicate_invalid_value_is_duplicate_before_validation(
+    tmp_path: Path,
+    field_name: str,
+    invalid_part: tuple[None, str],
+) -> None:
+    adapter = FakeAdapter()
+    app = create_qwen_app(_settings(tmp_path), adapter)
+    request_id = f"req_duplicate-invalid-{field_name}"
+    parts = _clone_multipart_parts()
+    parts.append((field_name, invalid_part))
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/internal/v1/speech/clone",
+            headers={"X-Request-ID": request_id},
+            files=parts,
+        )
+
+    _assert_clone_validation_details(
+        response,
+        request_id,
+        [{"field": field_name, "reason": "duplicate"}],
+    )
+    assert adapter.build_calls == []
+
+
 def test_ephemeral_clone_unknown_fields_are_sanitized_bounded_and_private(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
