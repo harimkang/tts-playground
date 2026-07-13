@@ -42,6 +42,16 @@ from tts_playground.qwen.voice_registry import MAX_AUDIO_BYTES, VoiceRegistry
 RequestHandler = Callable[[Request], Awaitable[Response]]
 SynthesisOperation = Callable[[], Awaitable[SynthesisResult]]
 _UPLOAD_CHUNK_BYTES = 1024 * 1024
+_EPHEMERAL_CLONE_FIELDS = frozenset(
+    {
+        "input",
+        "audio",
+        "consent_confirmed",
+        "transcript",
+        "language",
+        "response_format",
+    }
+)
 
 
 class _ObservedAdapter:
@@ -223,6 +233,7 @@ def create_qwen_app(settings: QwenSettings, adapter: QwenAdapter) -> FastAPI:
         language: Annotated[str, Form(min_length=2, max_length=10)] = "auto",
         response_format: Annotated[Literal["wav"], Form()] = "wav",
     ) -> Response:
+        await _validate_ephemeral_clone_fields(request)
         manager = _manager(request)
 
         async def synthesize_clone() -> SynthesisResult:
@@ -308,6 +319,20 @@ def create_qwen_app(settings: QwenSettings, adapter: QwenAdapter) -> FastAPI:
 
     app.add_middleware(_SanitizedExceptionMiddleware)
     return app
+
+
+async def _validate_ephemeral_clone_fields(request: Request) -> None:
+    form = await request.form()
+    field_names = [name for name, _value in form.multi_items()]
+    if (
+        any(name not in _EPHEMERAL_CLONE_FIELDS for name in field_names)
+        or len(field_names) != len(set(field_names))
+    ):
+        raise ServiceError(
+            status_code=422,
+            code="validation_error",
+            message="Request validation failed.",
+        )
 
 
 async def _read_bounded_upload(audio: UploadFile) -> bytes:

@@ -4,6 +4,17 @@ from pathlib import Path
 ROOT = Path(__file__).parents[2]
 
 
+def _fenced_code_after(document: str, marker: str) -> str:
+    marker_position = document.index(marker)
+    match = re.search(
+        r"```(?:sh|bash)\s*\n(?P<code>.*?)\n```",
+        document[marker_position:],
+        re.DOTALL,
+    )
+    assert match is not None, f"Missing fenced shell example after {marker}"
+    return match.group("code")
+
+
 def test_backend_timeout_configuration_is_documented() -> None:
     env_example = (ROOT / ".env.example").read_text(encoding="utf-8")
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
@@ -77,6 +88,29 @@ def test_docs_cover_registered_and_ephemeral_clone_lifecycles() -> None:
     ):
         assert example in readme
 
+    examples = {
+        "Persistent registration, text-assisted": (
+            "/v1/audio/voices",
+            True,
+        ),
+        "Persistent registration, speaker-embedding-only": (
+            "/v1/audio/voices",
+            False,
+        ),
+        "Ephemeral clone, text-assisted": (
+            "/v1/audio/speech/clone",
+            True,
+        ),
+        "Ephemeral clone, speaker-embedding-only": (
+            "/v1/audio/speech/clone",
+            False,
+        ),
+    }
+    for marker, (endpoint, includes_transcript) in examples.items():
+        code = _fenced_code_after(readme, marker)
+        assert f'"$TTS_BASE_URL{endpoint}"' in code
+        assert ("-F 'transcript=" in code) is includes_transcript
+
 
 def test_readme_enumerates_public_error_codes() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
@@ -111,6 +145,15 @@ def test_readme_enumerates_public_error_codes() -> None:
     for code, status in public_error_codes.items():
         row = rf"(?m)^\| {re.escape(status)} \| `{code}` \| \S.* \|$"
         assert re.search(row, readme), f"Missing documented mapping for {code}"
+
+    consent_row = re.search(r"(?m)^\| 422 \| `consent_required` \| (?P<text>.*) \|$", readme)
+    multipart_row = re.search(r"(?m)^\| 422 \| `invalid_multipart` \| (?P<text>.*) \|$", readme)
+    assert consent_row is not None
+    assert multipart_row is not None
+    for row in (consent_row, multipart_row):
+        description = row.group("text").lower()
+        assert "registration" in description
+        assert "ephemeral" in description
 
 
 def test_readme_has_explicit_sudo_preparation_command() -> None:

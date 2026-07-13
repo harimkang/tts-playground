@@ -40,9 +40,12 @@ AppLifespan = Callable[[FastAPI], AbstractAsyncContextManager[None]]
 
 
 @runtime_checkable
-class SynthesisRouter(Protocol):
+class SpeechSynthesisRouter(Protocol):
     async def synthesize(self, request: SpeechRequest, request_id: str) -> AudioResult: ...
 
+
+@runtime_checkable
+class EphemeralSynthesisRouter(Protocol):
     async def synthesize_ephemeral(
         self,
         *,
@@ -153,6 +156,27 @@ def create_gateway_app(
                 error_code=telemetry_error_code,
             )
             raise
+        except Exception:
+            metrics.record_request(
+                model=model_name,
+                status=500,
+                elapsed_seconds=perf_counter() - started_at,
+                audio_seconds=None,
+            )
+            log_gateway_request(
+                request_id=request_id,
+                model=model_name,
+                input_chars=input_chars or 0,
+                queue_ms=None,
+                processing_ms=None,
+                status=500,
+                error_code="internal_error",
+            )
+            raise ServiceError(
+                status_code=500,
+                code="internal_error",
+                message="Internal gateway error.",
+            ) from None
 
         metrics.record_request(
             model=model_name,
@@ -185,7 +209,7 @@ def create_gateway_app(
         request_id = _request_id(request)
 
         async def synthesize() -> AudioResult:
-            if not isinstance(backend_router, SynthesisRouter):
+            if not isinstance(backend_router, SpeechSynthesisRouter):
                 raise ServiceError(
                     status_code=503,
                     code="backend_not_configured",
@@ -208,7 +232,7 @@ def create_gateway_app(
         request_id = _request_id(request)
 
         async def synthesize() -> AudioResult:
-            if not isinstance(backend_router, SynthesisRouter):
+            if not isinstance(backend_router, EphemeralSynthesisRouter):
                 raise ServiceError(
                     status_code=503,
                     code="backend_not_configured",

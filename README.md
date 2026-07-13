@@ -236,9 +236,9 @@ JSON errors contain `error.code`, a safe message, and `request_id`. The public c
 | 413 | `request_too_large` | A synthesis JSON or complete multipart request exceeds its bounded size. |
 | 422 | `validation_error` | JSON/form data or model-specific fields fail public schema validation. |
 | 422 | `unsupported_language` | The selected backend does not support the requested language code. |
-| 422 | `consent_required` | Voice registration did not attest `consent_confirmed=true`. |
+| 422 | `consent_required` | Voice registration or ephemeral cloning did not attest `consent_confirmed=true`. |
 | 422 | `invalid_audio_duration` | Reference audio is shorter than 3 seconds or longer than 30 seconds. |
-| 422 | `invalid_multipart` | Voice-registration multipart content type, boundary, or byte stream is malformed. |
+| 422 | `invalid_multipart` | Voice-registration or ephemeral-clone multipart content type, boundary, or byte stream is malformed. |
 | 429 | `queue_full` | Three Qwen requests are already waiting by default; retry with backoff. |
 | 500 | `internal_error` | The Qwen worker encountered an unexpected internal failure; inspect its privacy-safe logs. |
 | 503 | `backend_not_configured` | A gateway was started without a backend router; this indicates deployment/configuration failure. |

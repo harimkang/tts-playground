@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from prometheus_client import generate_latest
 from starlette.exceptions import StarletteDeprecationWarning
 
 with warnings.catch_warnings():
@@ -12,6 +13,7 @@ with warnings.catch_warnings():
 
 from tts_playground.common.settings import GatewaySettings
 from tts_playground.gateway.app import create_gateway_app
+from tts_playground.gateway.backends import AudioResult
 
 
 def _create_client(
@@ -34,6 +36,33 @@ def _speech_body() -> dict[str, object]:
         "voice": "F1",
         "language": "en",
     }
+
+
+class _SynthesizeOnlyRouter:
+    async def synthesize(self, _request: object, _request_id: str) -> AudioResult:
+        return AudioResult(
+            content=b"RIFF\x00\x00\x00\x00WAVE",
+            content_type="audio/wav",
+            duration_seconds="0",
+            queue_ms=None,
+            processing_ms=None,
+        )
+
+
+class _UnexpectedRouter:
+    def __init__(self, marker: str) -> None:
+        self.marker = marker
+
+    async def synthesize(self, _request: object, _request_id: str) -> AudioResult:
+        raise RuntimeError(self.marker)
+
+    async def synthesize_ephemeral(self, **_kwargs: object) -> AudioResult:
+        raise RuntimeError(self.marker)
+
+
+class _FatalRouter:
+    async def synthesize(self, _request: object, _request_id: str) -> AudioResult:
+        raise BaseException("fatal marker")
 
 
 def test_health_is_public_and_speech_requires_auth(tmp_path: Path) -> None:
@@ -166,6 +195,93 @@ def test_authenticated_speech_reports_unconfigured_backend(tmp_path: Path) -> No
             "request_id": request_id,
         }
     }
+
+
+def test_synthesize_only_router_keeps_json_route_compatible_and_clone_unconfigured(
+    tmp_path: Path,
+) -> None:
+    key = tmp_path / "key"
+    key.write_text("secret-key\n")
+    client = _create_client(key, _SynthesizeOnlyRouter())
+    headers = {
+        "Authorization": "Bearer secret-key",
+        "X-Request-ID": "req_synthesize-only",
+    }
+
+    speech = client.post("/v1/audio/speech", headers=headers, json=_speech_body())
+    clone = client.post(
+        "/v1/audio/speech/clone",
+        headers=headers,
+        data={"input": "test", "consent_confirmed": "true"},
+        files={"audio": ("reference.wav", b"audio", "audio/wav")},
+    )
+
+    assert speech.status_code == 200
+    assert speech.headers["content-type"] == "audio/wav"
+    assert clone.status_code == 503
+    assert clone.json()["error"]["code"] == "backend_not_configured"
+
+
+@pytest.mark.parametrize("route", ["json", "ephemeral"])
+def test_unexpected_synthesis_errors_are_sanitized_recorded_and_not_backend_failures(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    route: str,
+) -> None:
+    marker = f"PRIVATE_GATEWAY_{route.upper()}_EXCEPTION"
+    key = tmp_path / "key"
+    key.write_text("secret-key\n")
+    app = create_gateway_app(
+        GatewaySettings(api_key_file=key),
+        backend_router=_UnexpectedRouter(marker),
+    )
+    client = TestClient(app, raise_server_exceptions=False)
+    headers = {
+        "Authorization": "Bearer secret-key",
+        "X-Request-ID": f"req_unexpected-{route}",
+    }
+
+    if route == "json":
+        response = client.post("/v1/audio/speech", headers=headers, json=_speech_body())
+        model = "supertonic-3"
+    else:
+        response = client.post(
+            "/v1/audio/speech/clone",
+            headers=headers,
+            data={"input": marker, "consent_confirmed": "true"},
+            files={"audio": (f"{marker}.wav", marker.encode(), "audio/wav")},
+        )
+        model = "qwen3-tts-1.7b-clone"
+
+    metrics = generate_latest(app.state.gateway_metrics.registry).decode()
+    captured = capsys.readouterr()
+    public_output = response.text + captured.out + captured.err
+
+    assert response.status_code == 500
+    assert response.json()["error"] == {
+        "code": "internal_error",
+        "message": "Internal gateway error.",
+        "request_id": f"req_unexpected-{route}",
+    }
+    assert f'tts_gateway_requests_total{{model="{model}",status="500"}} 1.0' in metrics
+    assert "tts_gateway_backend_errors_total{" not in metrics
+    assert '"status": 500' in captured.out
+    assert '"error_code": "internal_error"' in captured.out
+    assert marker not in public_output
+
+
+def test_synthesis_does_not_catch_base_exception(tmp_path: Path) -> None:
+    key = tmp_path / "key"
+    key.write_text("secret-key\n")
+    client = _create_client(key, _FatalRouter())
+
+    with pytest.raises(BaseException) as raised:
+        client.post(
+            "/v1/audio/speech",
+            headers={"Authorization": "Bearer secret-key"},
+            json=_speech_body(),
+        )
+    assert "fatal marker" in repr(raised.value)
 
 
 def test_non_null_backend_is_controlled_until_routing_is_implemented(tmp_path: Path) -> None:

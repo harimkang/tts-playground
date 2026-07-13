@@ -120,6 +120,17 @@ def _clone_form(**updates: str) -> dict[str, str]:
     return form
 
 
+def _clone_multipart_parts() -> list[tuple[str, tuple[None, str] | tuple[str, bytes, str]]]:
+    return [
+        ("input", (None, "새로 합성할 문장")),
+        ("consent_confirmed", (None, "true")),
+        ("transcript", (None, "exact text")),
+        ("language", (None, "auto")),
+        ("response_format", (None, "wav")),
+        ("audio", ("reference.wav", _wav_bytes(), "audio/wav")),
+    ]
+
+
 def _registry_files(voice_data_dir: Path) -> set[Path]:
     return {
         path.relative_to(voice_data_dir)
@@ -443,6 +454,66 @@ def test_ephemeral_clone_requires_consent_before_prompt_build(tmp_path: Path) ->
     assert response.status_code == 422
     assert response.json()["error"]["code"] == "validation_error"
     assert adapter.build_calls == []
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    ["voice", "instructions", "speed", "steps", "unknown_private_field"],
+)
+def test_ephemeral_clone_rejects_unknown_fields_before_prompt_build(
+    tmp_path: Path,
+    field_name: str,
+) -> None:
+    adapter = FakeAdapter()
+    settings = _settings(tmp_path)
+    app = create_qwen_app(settings, adapter)
+    parts = _clone_multipart_parts()
+    private_value = "PRIVATE_UNKNOWN_FIELD_VALUE"
+    parts.append((field_name, (None, private_value)))
+
+    with TestClient(app) as client:
+        files_before = _registry_files(settings.voice_data_dir)
+        response = client.post("/internal/v1/speech/clone", files=parts)
+        files_after = _registry_files(settings.voice_data_dir)
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "validation_error"
+    assert private_value not in response.text
+    assert adapter.build_calls == []
+    assert files_before == files_after
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "input",
+        "audio",
+        "consent_confirmed",
+        "transcript",
+        "language",
+        "response_format",
+    ],
+)
+def test_ephemeral_clone_rejects_duplicate_singular_fields_before_prompt_build(
+    tmp_path: Path,
+    field_name: str,
+) -> None:
+    adapter = FakeAdapter()
+    settings = _settings(tmp_path)
+    app = create_qwen_app(settings, adapter)
+    parts = _clone_multipart_parts()
+    duplicate = next(part for name, part in parts if name == field_name)
+    parts.append((field_name, duplicate))
+
+    with TestClient(app) as client:
+        files_before = _registry_files(settings.voice_data_dir)
+        response = client.post("/internal/v1/speech/clone", files=parts)
+        files_after = _registry_files(settings.voice_data_dir)
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "validation_error"
+    assert adapter.build_calls == []
+    assert files_before == files_after
 
 
 @pytest.mark.parametrize("failure_stage", ["build", "synthesis"])

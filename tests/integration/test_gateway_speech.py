@@ -6,15 +6,44 @@ import httpx
 import pytest
 import respx
 
-from tts_playground.common.settings import GatewaySettings
+from tts_playground.common.settings import GatewaySettings, QwenSettings
 from tts_playground.gateway.app import create_gateway_app
 from tts_playground.gateway.backends import BackendRouter
+from tts_playground.qwen.adapter import InternalSpeechRequest, SynthesisResult
+from tts_playground.qwen.app import create_qwen_app
 
 VALID_WAV = (
     b"RIFF\x24\x00\x00\x00WAVE"
     b"fmt \x10\x00\x00\x00\x01\x00\x01\x00\x40\x1f\x00\x00"
     b"\x80\x3e\x00\x00\x02\x00\x10\x00data\x00\x00\x00\x00"
 )
+
+
+class _UnusedQwenAdapter:
+    def free_vram_bytes(self) -> int:
+        raise AssertionError("field validation must precede GPU access")
+
+    def load(self, repository: str, attention_implementation: str) -> object:
+        raise AssertionError("field validation must precede model loading")
+
+    def cleanup_device_memory(self) -> None:
+        raise AssertionError("field validation must precede device cleanup")
+
+    def build_clone_prompt(
+        self,
+        model: object,
+        audio_path: Path,
+        transcript: str | None,
+    ) -> object:
+        raise AssertionError("field validation must precede prompt building")
+
+    def synthesize(
+        self,
+        model: object,
+        request: InternalSpeechRequest,
+        clone_prompt: object | None,
+    ) -> SynthesisResult:
+        raise AssertionError("field validation must precede synthesis")
 
 
 @pytest.fixture
@@ -383,6 +412,74 @@ async def test_ephemeral_clone_transport_errors_increment_qwen_metrics(
     assert response.status_code == status
     assert response.json()["error"]["code"] == code
     assert f'tts_gateway_backend_errors_total{{backend="qwen",code="{code}"}} 1.0' in metrics.text
+
+
+@pytest.mark.parametrize(
+    ("field_name", "duplicate"),
+    [
+        ("voice", False),
+        ("instructions", False),
+        ("speed", False),
+        ("steps", False),
+        ("unknown_private_field", False),
+        ("input", True),
+        ("audio", True),
+        ("consent_confirmed", True),
+        ("transcript", True),
+        ("language", True),
+        ("response_format", True),
+    ],
+)
+async def test_public_clone_preserves_worker_validation_for_unknown_and_duplicate_fields(
+    tmp_path: Path,
+    field_name: str,
+    duplicate: bool,
+) -> None:
+    key_file = tmp_path / "api-key"
+    key_file.write_text("secret-key\n", encoding="utf-8")
+    gateway_settings = GatewaySettings(api_key_file=key_file)
+    qwen_settings = QwenSettings(
+        voice_data_dir=tmp_path / "voices",
+        min_free_vram_bytes=0,
+    )
+    qwen_app = create_qwen_app(qwen_settings, _UnusedQwenAdapter())
+    parts: list[tuple[str, tuple[None, str] | tuple[str, bytes, str]]] = [
+        ("input", (None, "test")),
+        ("consent_confirmed", (None, "true")),
+        ("transcript", (None, "exact text")),
+        ("language", (None, "auto")),
+        ("response_format", (None, "wav")),
+        ("audio", ("reference.wav", b"PRIVATE_INVALID_AUDIO", "audio/wav")),
+    ]
+    if duplicate:
+        duplicate_part = next(part for name, part in parts if name == field_name)
+        parts.append((field_name, duplicate_part))
+    else:
+        parts.append((field_name, (None, "PRIVATE_FORBIDDEN_VALUE")))
+
+    async with qwen_app.router.lifespan_context(qwen_app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=qwen_app),
+        ) as backend_client:
+            router = BackendRouter(gateway_settings, backend_client)
+            gateway_app = create_gateway_app(gateway_settings, router)
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=gateway_app),
+                base_url="http://gateway",
+            ) as client:
+                response = await client.post(
+                    "/v1/audio/speech/clone",
+                    headers=_authorization("req_public-field-validation"),
+                    files=parts,
+                )
+
+    assert response.status_code == 422
+    assert response.json()["error"] == {
+        "code": "validation_error",
+        "message": "Backend request failed.",
+        "request_id": "req_public-field-validation",
+    }
+    assert "PRIVATE_FORBIDDEN_VALUE" not in response.text
 
 
 @respx.mock
