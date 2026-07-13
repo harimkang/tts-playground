@@ -60,6 +60,7 @@ _MAX_MULTIPART_NON_AUDIO_BYTES: Final = 1024 * 1024
 _MAX_MULTIPART_HEADER_BYTES: Final = 4224
 _MAX_MULTIPART_HEADER_COUNT: Final = 8
 _MAX_MULTIPART_BOUNDARY_BYTES: Final = 200
+_MAX_INPUT_CHARS: Final = 2000
 _PUBLIC_VOICE_FIELDS: Final = (
     "id",
     "name",
@@ -77,6 +78,7 @@ class AudioResult:
     duration_seconds: str | None
     queue_ms: str | None
     processing_ms: str | None
+    input_chars: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,22 +109,7 @@ class BackendRouter:
             _raise_upstream_error(response)
         _validate_wav_response(response)
 
-        return AudioResult(
-            content=response.content,
-            content_type="audio/wav",
-            duration_seconds=normalize_bounded_nonnegative(
-                response.headers.get("x-audio-duration"),
-                maximum=MAX_AUDIO_DURATION_SECONDS,
-            ),
-            queue_ms=normalize_bounded_nonnegative(
-                response.headers.get("x-queue-ms"),
-                maximum=MAX_TIMING_MILLISECONDS,
-            ),
-            processing_ms=normalize_bounded_nonnegative(
-                response.headers.get("x-processing-ms"),
-                maximum=MAX_TIMING_MILLISECONDS,
-            ),
-        )
+        return _audio_result(response)
 
     async def discover(self, request_id: str) -> DiscoveryResult:
         styles_response = await self._request(
@@ -158,39 +145,12 @@ class BackendRouter:
         content_length: int | None,
         request_id: str,
     ) -> ProxyResult:
-        maximum_request_bytes = (
-            self._settings.max_upload_bytes + _MAX_MULTIPART_NON_AUDIO_BYTES
-        )
-        limiter = _MultipartAudioLimiter(
-            content_type,
-            maximum_audio_bytes=self._settings.max_upload_bytes,
-            maximum_request_bytes=maximum_request_bytes,
-        )
-        if (
-            content_length is not None
-            and content_length > maximum_request_bytes
-        ):
-            raise _multipart_request_too_large()
-
-        async def bounded_content() -> AsyncIterator[bytes]:
-            async for chunk in content:
-                limiter.write(chunk)
-                yield chunk
-            limiter.finalize()
-
-        headers = {
-            "Content-Type": limiter.content_type,
-            "X-Request-ID": request_id,
-        }
-        if content_length is not None:
-            headers["Content-Length"] = str(content_length)
-        response = await self._request(
-            "POST",
-            f"{self._settings.qwen_url.rstrip('/')}/internal/v1/voices",
+        response = await self._post_bounded_multipart(
+            path="/internal/v1/voices",
+            content=content,
+            content_type=content_type,
+            content_length=content_length,
             request_id=request_id,
-            timeout_seconds=self._settings.qwen_timeout_seconds,
-            headers=headers,
-            content=bounded_content(),
         )
         if not response.is_success:
             _raise_upstream_error(response)
@@ -198,6 +158,26 @@ class BackendRouter:
             status_code=response.status_code,
             payload=_public_voice(_read_json(response)),
         )
+
+    async def synthesize_ephemeral(
+        self,
+        *,
+        content: AsyncIterator[bytes],
+        content_type: str | None,
+        content_length: int | None,
+        request_id: str,
+    ) -> AudioResult:
+        response = await self._post_bounded_multipart(
+            path="/internal/v1/speech/clone",
+            content=content,
+            content_type=content_type,
+            content_length=content_length,
+            request_id=request_id,
+        )
+        if not response.is_success:
+            _raise_upstream_error(response)
+        _validate_wav_response(response)
+        return _audio_result(response, include_input_chars=True)
 
     async def list_voices(self, request_id: str) -> ProxyResult:
         response = await self._qwen_voice_request("GET", None, request_id)
@@ -268,6 +248,44 @@ class BackendRouter:
         if not response.is_success:
             _raise_upstream_error(response)
         return response
+
+    async def _post_bounded_multipart(
+        self,
+        *,
+        path: str,
+        content: AsyncIterator[bytes],
+        content_type: str | None,
+        content_length: int | None,
+        request_id: str,
+    ) -> httpx.Response:
+        maximum_request_bytes = (
+            self._settings.max_upload_bytes + _MAX_MULTIPART_NON_AUDIO_BYTES
+        )
+        limiter = _MultipartAudioLimiter(
+            content_type,
+            maximum_audio_bytes=self._settings.max_upload_bytes,
+            maximum_request_bytes=maximum_request_bytes,
+        )
+        if content_length is not None and content_length > maximum_request_bytes:
+            raise _multipart_request_too_large()
+
+        async def bounded_content() -> AsyncIterator[bytes]:
+            async for chunk in content:
+                limiter.write(chunk)
+                yield chunk
+            limiter.finalize()
+
+        headers = {"Content-Type": limiter.content_type}
+        if content_length is not None:
+            headers["Content-Length"] = str(content_length)
+        return await self._request(
+            "POST",
+            f"{self._settings.qwen_url.rstrip('/')}{path}",
+            request_id=request_id,
+            timeout_seconds=self._settings.qwen_timeout_seconds,
+            headers=headers,
+            content=bounded_content(),
+        )
 
     async def _check_ready(
         self,
@@ -503,6 +521,47 @@ def _read_json(response: httpx.Response) -> object:
         return response.json()
     except ValueError:
         raise _invalid_backend_response() from None
+
+
+def _audio_result(
+    response: httpx.Response,
+    *,
+    include_input_chars: bool = False,
+) -> AudioResult:
+    return AudioResult(
+        content=response.content,
+        content_type="audio/wav",
+        duration_seconds=normalize_bounded_nonnegative(
+            response.headers.get("x-audio-duration"),
+            maximum=MAX_AUDIO_DURATION_SECONDS,
+        ),
+        queue_ms=normalize_bounded_nonnegative(
+            response.headers.get("x-queue-ms"),
+            maximum=MAX_TIMING_MILLISECONDS,
+        ),
+        processing_ms=normalize_bounded_nonnegative(
+            response.headers.get("x-processing-ms"),
+            maximum=MAX_TIMING_MILLISECONDS,
+        ),
+        input_chars=(
+            _parse_bounded_input_chars(response.headers.get("x-input-chars"))
+            if include_input_chars
+            else None
+        ),
+    )
+
+
+def _parse_bounded_input_chars(value: str | None) -> int | None:
+    if (
+        value is None
+        or not value
+        or len(value) > len(str(_MAX_INPUT_CHARS))
+        or not value.isascii()
+        or not value.isdecimal()
+    ):
+        return None
+    parsed = int(value)
+    return parsed if parsed <= _MAX_INPUT_CHARS else None
 
 
 def _read_supertonic_voices(response: httpx.Response) -> list[str]:

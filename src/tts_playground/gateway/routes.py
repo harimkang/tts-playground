@@ -43,6 +43,9 @@ _QWEN_CLONE_CAPABILITIES = {
     "voice": True,
     "voice_cloning": True,
     "voice_design": False,
+    "registered_reference": True,
+    "ephemeral_reference": True,
+    "reference_text_optional": True,
 }
 
 

@@ -132,7 +132,17 @@ async def test_models_expose_stable_ids_voices_capabilities_and_worker_state(
     assert models["qwen3-tts-1.7b-design"]["loaded"] is False
     assert models["qwen3-tts-1.7b-clone"]["loaded"] is False
     assert models["qwen3-tts-1.7b-design"]["capabilities"]["voice_design"] is True
-    assert models["qwen3-tts-1.7b-clone"]["capabilities"]["voice_cloning"] is True
+    assert models["qwen3-tts-1.7b-clone"]["capabilities"] == {
+        "instructions": False,
+        "speed": False,
+        "steps": False,
+        "voice": True,
+        "voice_cloning": True,
+        "voice_design": False,
+        "registered_reference": True,
+        "ephemeral_reference": True,
+        "reference_text_optional": True,
+    }
 
 
 @respx.mock

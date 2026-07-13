@@ -43,6 +43,15 @@ AppLifespan = Callable[[FastAPI], AbstractAsyncContextManager[None]]
 class SynthesisRouter(Protocol):
     async def synthesize(self, request: SpeechRequest, request_id: str) -> AudioResult: ...
 
+    async def synthesize_ephemeral(
+        self,
+        *,
+        content: AsyncIterator[bytes],
+        content_type: str | None,
+        content_length: int | None,
+        request_id: str,
+    ) -> AudioResult: ...
+
 
 def create_gateway_app(
     settings: GatewaySettings,
@@ -109,41 +118,35 @@ def create_gateway_app(
 
     app.include_router(create_management_router(backend_router, authenticate, metrics))
 
-    @app.post("/v1/audio/speech")
-    async def speech(
-        request: Request,
-        speech_request: SpeechRequest,
-        _authenticated: Annotated[None, Depends(authenticate)],
+    async def synthesis_response(
+        *,
+        request_id: str,
+        model: ModelID,
+        input_chars: int | None,
+        operation: Callable[[], Awaitable[AudioResult]],
     ) -> Response:
         started_at = perf_counter()
-        request_id = _request_id(request)
-        model = speech_request.model.value
+        model_name = model.value
 
         try:
-            if not isinstance(backend_router, SynthesisRouter):
-                raise ServiceError(
-                    status_code=503,
-                    code="backend_not_configured",
-                    message="Backend router is not configured.",
-                )
-            audio = await backend_router.synthesize(speech_request, request_id)
+            audio = await operation()
         except ServiceError as error:
             telemetry_error_code = normalize_error_code(error.code) or "backend_error"
             metrics.record_request(
-                model=model,
+                model=model_name,
                 status=error.status_code,
                 elapsed_seconds=perf_counter() - started_at,
                 audio_seconds=None,
             )
             if error.backend_failure:
                 metrics.record_backend_error(
-                    backend=_backend_name(speech_request.model),
+                    backend=_backend_name(model),
                     code=telemetry_error_code,
                 )
             log_gateway_request(
                 request_id=request_id,
-                model=model,
-                input_chars=len(speech_request.input),
+                model=model_name,
+                input_chars=input_chars or 0,
                 queue_ms=None,
                 processing_ms=None,
                 status=error.status_code,
@@ -152,26 +155,78 @@ def create_gateway_app(
             raise
 
         metrics.record_request(
-            model=model,
+            model=model_name,
             status=200,
             elapsed_seconds=perf_counter() - started_at,
             audio_seconds=_parse_nonnegative_float(audio.duration_seconds),
         )
         log_gateway_request(
             request_id=request_id,
-            model=model,
-            input_chars=len(speech_request.input),
+            model=model_name,
+            input_chars=input_chars if input_chars is not None else audio.input_chars or 0,
             queue_ms=audio.queue_ms,
             processing_ms=audio.processing_ms,
             status=200,
             error_code=None,
         )
 
-        headers = {"X-TTS-Model": model, "Content-Type": audio.content_type}
+        headers = {"X-TTS-Model": model_name, "Content-Type": audio.content_type}
         _copy_header(headers, "X-Audio-Duration", audio.duration_seconds)
         _copy_header(headers, "X-Queue-Ms", audio.queue_ms)
         _copy_header(headers, "X-Processing-Ms", audio.processing_ms)
         return Response(content=audio.content, headers=headers)
+
+    @app.post("/v1/audio/speech")
+    async def speech(
+        request: Request,
+        speech_request: SpeechRequest,
+        _authenticated: Annotated[None, Depends(authenticate)],
+    ) -> Response:
+        request_id = _request_id(request)
+
+        async def synthesize() -> AudioResult:
+            if not isinstance(backend_router, SynthesisRouter):
+                raise ServiceError(
+                    status_code=503,
+                    code="backend_not_configured",
+                    message="Backend router is not configured.",
+                )
+            return await backend_router.synthesize(speech_request, request_id)
+
+        return await synthesis_response(
+            request_id=request_id,
+            model=speech_request.model,
+            input_chars=len(speech_request.input),
+            operation=synthesize,
+        )
+
+    @app.post("/v1/audio/speech/clone")
+    async def ephemeral_clone(
+        request: Request,
+        _authenticated: Annotated[None, Depends(authenticate)],
+    ) -> Response:
+        request_id = _request_id(request)
+
+        async def synthesize() -> AudioResult:
+            if not isinstance(backend_router, SynthesisRouter):
+                raise ServiceError(
+                    status_code=503,
+                    code="backend_not_configured",
+                    message="Backend router is not configured.",
+                )
+            return await backend_router.synthesize_ephemeral(
+                content=request.stream(),
+                content_type=request.headers.get("content-type"),
+                content_length=_content_length(request),
+                request_id=request_id,
+            )
+
+        return await synthesis_response(
+            request_id=request_id,
+            model=ModelID.QWEN_CLONE,
+            input_chars=None,
+            operation=synthesize,
+        )
 
     app.add_middleware(
         _SynthesisBodyLimitMiddleware,
@@ -243,6 +298,21 @@ class _RuntimeBackendRouter:
     async def synthesize(self, request: SpeechRequest, request_id: str) -> AudioResult:
         return await self._require_backend().synthesize(request, request_id)
 
+    async def synthesize_ephemeral(
+        self,
+        *,
+        content: AsyncIterator[bytes],
+        content_type: str | None,
+        content_length: int | None,
+        request_id: str,
+    ) -> AudioResult:
+        return await self._require_backend().synthesize_ephemeral(
+            content=content,
+            content_type=content_type,
+            content_length=content_length,
+            request_id=request_id,
+        )
+
     async def discover(self, request_id: str) -> DiscoveryResult:
         return await self._require_backend().discover(request_id)
 
@@ -287,6 +357,27 @@ def _request_id(request: Request) -> str:
     if isinstance(request_id, str):
         return request_id
     return resolve_request_id(None)
+
+
+def _content_length(request: Request) -> int | None:
+    raw_content_length = request.headers.get("content-length")
+    if raw_content_length is None:
+        return None
+    try:
+        content_length = int(raw_content_length)
+    except ValueError:
+        raise ServiceError(
+            status_code=422,
+            code="validation_error",
+            message="Request validation failed.",
+        ) from None
+    if content_length < 0:
+        raise ServiceError(
+            status_code=422,
+            code="validation_error",
+            message="Request validation failed.",
+        )
+    return content_length
 
 
 def _error_response(

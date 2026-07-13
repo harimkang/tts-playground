@@ -82,6 +82,66 @@ def test_speech_rejects_invalid_authorization(
     assert response.json()["error"]["code"] == "unauthorized"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("authorization", [None, "Bearer wrong-key"])
+async def test_clone_authentication_rejects_before_reading_multipart_body(
+    tmp_path: Path,
+    authorization: str | None,
+) -> None:
+    key = tmp_path / "key"
+    key.write_text("secret-key\n")
+    app = create_gateway_app(
+        GatewaySettings(api_key_file=key, max_synthesis_body_bytes=1),
+        backend_router=None,
+    )
+    receive_calls = 0
+    sent: list[dict[str, Any]] = []
+
+    async def receive() -> dict[str, Any]:
+        nonlocal receive_calls
+        receive_calls += 1
+        return {
+            "type": "http.request",
+            "body": b"PRIVATE_MULTIPART_MARKER",
+            "more_body": False,
+        }
+
+    async def send(message: dict[str, Any]) -> None:
+        sent.append(message)
+
+    headers = [
+        (b"content-type", b"multipart/form-data; boundary=boundary"),
+        (b"content-length", b"99999999"),
+        (b"x-request-id", b"req_clone-auth-before-read"),
+    ]
+    if authorization is not None:
+        headers.append((b"authorization", authorization.encode("ascii")))
+
+    await app(
+        {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "http",
+            "path": "/v1/audio/speech/clone",
+            "raw_path": b"/v1/audio/speech/clone",
+            "query_string": b"",
+            "root_path": "",
+            "headers": headers,
+            "client": ("127.0.0.1", 1234),
+            "server": ("gateway", 80),
+            "state": {},
+        },
+        receive,
+        send,
+    )
+
+    assert receive_calls == 0
+    assert sent[0]["status"] == 401
+    assert b'"code":"unauthorized"' in sent[1]["body"]
+
+
 def test_authenticated_speech_reports_unconfigured_backend(tmp_path: Path) -> None:
     key = tmp_path / "key"
     key.write_text("secret-key\n")
