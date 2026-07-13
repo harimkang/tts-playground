@@ -331,17 +331,18 @@ async def _normalize_reference_audio_to_completion(
         asyncio.to_thread(normalize_reference_audio, audio, destination)
     )
     cancellation_requested = False
-    while True:
+    while not task.done():
         try:
-            result = await asyncio.shield(task)
+            await asyncio.shield(task)
         except asyncio.CancelledError:
             cancellation_requested = True
-            if not task.done():
-                continue
-            result = task.result()
-        if cancellation_requested:
-            raise asyncio.CancelledError
-        return result
+        except Exception:
+            break
+    if cancellation_requested:
+        if not task.cancelled():
+            task.exception()
+        raise asyncio.CancelledError
+    return task.result()
 
 
 async def _observe_synthesis(

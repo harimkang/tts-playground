@@ -570,6 +570,104 @@ async def test_ephemeral_clone_cancellation_waits_for_normalization_before_clean
             assert not temporary_path.parent.exists()
 
 
+async def test_ephemeral_clone_cancellation_wins_when_normalization_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    marker = "PRIVATE_CANCELLED_NORMALIZATION_FAILURE"
+    normalization_started = threading.Event()
+    release_normalization = threading.Event()
+    temporary_paths: list[Path] = []
+
+    def failing_normalizer(_audio: bytes, destination: Path) -> float:
+        temporary_paths.append(destination)
+        destination.write_bytes(b"normalization in progress")
+        normalization_started.set()
+        if not release_normalization.wait(timeout=2.0):
+            raise AssertionError("test did not release blocked normalization")
+        raise RuntimeError(marker)
+
+    monkeypatch.setattr(
+        "tts_playground.qwen.app.normalize_reference_audio",
+        failing_normalizer,
+    )
+    app = create_qwen_app(_settings(tmp_path), FakeAdapter())
+    transport = httpx.ASGITransport(app=app)
+
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            request_task = asyncio.create_task(
+                client.post(
+                    "/internal/v1/speech/clone",
+                    data=_clone_form(),
+                    files={"audio": ("private.wav", _wav_bytes(), "audio/wav")},
+                )
+            )
+            assert await asyncio.to_thread(normalization_started.wait, 1.0)
+            temporary_path = temporary_paths[0]
+            assert temporary_path.exists()
+
+            request_task.cancel()
+            await asyncio.sleep(0.05)
+            assert not request_task.done()
+            assert temporary_path.exists()
+            assert temporary_path.parent.exists()
+
+            release_normalization.set()
+            with pytest.raises(asyncio.CancelledError):
+                await request_task
+
+            assert not temporary_path.exists()
+            assert not temporary_path.parent.exists()
+            metrics = await client.get("/metrics")
+            await asyncio.sleep(0)
+            assert (
+                'tts_qwen_requests_total{model="qwen3-tts-1.7b-clone",status="500"}'
+                not in metrics.text
+            )
+            assert 'tts_qwen_errors_total{code="internal_error"}' not in metrics.text
+            assert "Task exception was never retrieved" not in caplog.text
+            assert marker not in caplog.text
+
+
+def test_ephemeral_clone_normalization_failure_without_cancellation_is_sanitized(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    marker = "PRIVATE_NORMALIZATION_FAILURE"
+    temporary_paths: list[Path] = []
+
+    def failing_normalizer(_audio: bytes, destination: Path) -> float:
+        temporary_paths.append(destination)
+        destination.write_bytes(b"normalization failed")
+        raise RuntimeError(marker)
+
+    monkeypatch.setattr(
+        "tts_playground.qwen.app.normalize_reference_audio",
+        failing_normalizer,
+    )
+    app = create_qwen_app(_settings(tmp_path), FakeAdapter())
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/internal/v1/speech/clone",
+            data=_clone_form(),
+            files={"audio": ("private.wav", _wav_bytes(), "audio/wav")},
+        )
+
+    assert response.status_code == 500
+    assert response.json()["error"]["code"] == "internal_error"
+    assert len(temporary_paths) == 1
+    assert not temporary_paths[0].exists()
+    assert not temporary_paths[0].parent.exists()
+    captured = capsys.readouterr()
+    public_output = response.text + caplog.text + captured.out + captured.err
+    assert marker not in public_output
+
+
 def test_ephemeral_clone_metrics_record_success_and_sanitized_failure(tmp_path: Path) -> None:
     adapter = FakeAdapter()
     app = create_qwen_app(_settings(tmp_path), adapter)
