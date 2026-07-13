@@ -46,6 +46,38 @@ def test_readme_documents_complete_uv_locked_operator_workflow() -> None:
     assert not re.search(r"\b(?:pip(?:3)? install|poetry|conda)\b", readme, re.IGNORECASE)
 
 
+def test_docs_cover_registered_and_ephemeral_clone_lifecycles() -> None:
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+
+    required_fragments = (
+        "POST /v1/audio/speech/clone",
+        "transcript",
+        "speaker-embedding-only",
+        "text-assisted",
+        "x_vector_only_mode",
+        "not persisted",
+        "data volume",
+        "/tmp",
+        "after every exit path",
+        "DELETE /v1/audio/voices/{voice_id}",
+        "WAV or FLAC",
+        "3 and 30 seconds",
+        "20 MB",
+        "2 channels",
+        "192 kHz",
+        "6,000,000 decoded samples",
+    )
+    assert all(fragment in readme for fragment in required_fragments)
+
+    for example in (
+        "Persistent registration, text-assisted",
+        "Persistent registration, speaker-embedding-only",
+        "Ephemeral clone, text-assisted",
+        "Ephemeral clone, speaker-embedding-only",
+    ):
+        assert example in readme
+
+
 def test_readme_enumerates_public_error_codes() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     public_error_codes = {

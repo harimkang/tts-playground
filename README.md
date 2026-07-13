@@ -156,22 +156,33 @@ curl --fail --silent --show-error \
 
 Qwen rejects `steps` and non-default `speed`; VoiceDesign requires `instructions` and rejects `voice`.
 
-## Voice registration lifecycle
+## Voice clone workflows and lifecycle
 
-`POST /v1/audio/voices` accepts a direct WAV or FLAC upload between 3 and 30 seconds and no larger than 20 MB. URL inputs are not accepted.
+`POST /v1/audio/voices` registers a reusable reference, while `POST /v1/audio/speech/clone` uses one only for the current request. Both clone workflows accept a direct WAV or FLAC reference between 3 and 30 seconds, no larger than 20 MB, with at most 2 channels, a sample rate no higher than 192 kHz, and at most 6,000,000 decoded samples total across channels. URL inputs are not accepted. `transcript` is optional: include an exact reference transcript for text-assisted cloning, which generally gives better pronunciation and similarity, or omit it for speaker-embedding-only cloning. Internally, omission enables `x_vector_only_mode`; it is convenient when no reliable transcript exists but may reduce clone quality.
+
+Persistent registration, text-assisted:
 
 ```sh
 curl --fail --silent --show-error \
   -H "Authorization: Bearer $TTS_API_KEY" \
-  -F 'name=approved-korean-reference' \
-  -F 'language=ko' \
-  -F 'transcript=이 문장은 등록용 기준 음성입니다.' \
+  -F 'name=approved-reference' -F 'language=ko' \
+  -F 'transcript=정확한 기준 음성 녹취' -F 'consent_confirmed=true' \
+  -F 'audio=@reference.wav;type=audio/wav' \
+  "$TTS_BASE_URL/v1/audio/voices"
+```
+
+Persistent registration, speaker-embedding-only (omit `transcript`):
+
+```sh
+curl --fail --silent --show-error \
+  -H "Authorization: Bearer $TTS_API_KEY" \
+  -F 'name=approved-reference' -F 'language=ko' \
   -F 'consent_confirmed=true' \
   -F 'audio=@reference.wav;type=audio/wav' \
   "$TTS_BASE_URL/v1/audio/voices"
 ```
 
-Copy the returned opaque `voice_...` ID into `VOICE_ID`. List registrations with `GET /v1/audio/voices`, use the ID with the `qwen3-tts-1.7b-clone` example above, and delete it with `DELETE /v1/audio/voices/{voice_id}`:
+Copy the returned opaque `voice_...` ID into `VOICE_ID`. A registered reference and its private transcript persist in the registry data volume until explicitly deleted. List registrations with `GET /v1/audio/voices`, use the ID with the `qwen3-tts-1.7b-clone` example above, and delete it with `DELETE /v1/audio/voices/{voice_id}`:
 
 ```sh
 export VOICE_ID='voice_replace_with_returned_id'
@@ -182,6 +193,31 @@ curl --fail --silent --show-error -X DELETE \
   -H "Authorization: Bearer $TTS_API_KEY" \
   "$TTS_BASE_URL/v1/audio/voices/$VOICE_ID"
 ```
+
+`POST /v1/audio/speech/clone` performs a one-request clone without creating a voice ID. Ephemeral clone, text-assisted:
+
+```sh
+curl --fail --silent --show-error \
+  -H "Authorization: Bearer $TTS_API_KEY" \
+  -F 'input=이번 요청에서만 이 목소리를 사용합니다.' -F 'language=ko' \
+  -F 'transcript=정확한 기준 음성 녹취' -F 'consent_confirmed=true' \
+  -F 'audio=@reference.wav;type=audio/wav' \
+  -o ephemeral-clone.wav \
+  "$TTS_BASE_URL/v1/audio/speech/clone"
+```
+
+Ephemeral clone, speaker-embedding-only (omit `transcript`):
+
+```sh
+curl --fail --silent --show-error \
+  -H "Authorization: Bearer $TTS_API_KEY" \
+  -F 'input=이번 요청에서만 이 목소리를 사용합니다.' -F 'language=ko' \
+  -F 'consent_confirmed=true' -F 'audio=@reference.wav;type=audio/wav' \
+  -o ephemeral-clone.wav \
+  "$TTS_BASE_URL/v1/audio/speech/clone"
+```
+
+Ephemeral references are not persisted: they are never added to the registry or data volume, and their private `qwen-clone-*` working directory is removed from `/tmp` after every exit path, including validation, backend failure, timeout, and cancellation.
 
 **Legal/consent warning:** `consent_confirmed=true` records only the caller's attestation. It is not proof of consent and is not a substitute for copyright, publicity, privacy, employment, contractual, or other legal authority to clone or use a person's voice. The operator and caller remain responsible for lawful collection and use.
 
