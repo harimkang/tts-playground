@@ -415,25 +415,58 @@ async def test_ephemeral_clone_transport_errors_increment_qwen_metrics(
 
 
 @pytest.mark.parametrize(
-    ("field_name", "duplicate"),
+    ("case", "field_name", "reason"),
     [
-        ("voice", False),
-        ("instructions", False),
-        ("speed", False),
-        ("steps", False),
-        ("unknown_private_field", False),
-        ("input", True),
-        ("audio", True),
-        ("consent_confirmed", True),
-        ("transcript", True),
-        ("language", True),
-        ("response_format", True),
+        pytest.param("missing", "input", "required", id="missing"),
+        pytest.param("invalid", "language", "invalid", id="invalid"),
+        pytest.param("forbidden", "voice", "unknown", id="forbidden-voice"),
+        pytest.param(
+            "forbidden",
+            "instructions",
+            "unknown",
+            id="forbidden-instructions",
+        ),
+        pytest.param("forbidden", "speed", "unknown", id="forbidden-speed"),
+        pytest.param("forbidden", "steps", "unknown", id="forbidden-steps"),
+        pytest.param(
+            "unknown",
+            "unknown_private_field",
+            "unknown",
+            id="unknown",
+        ),
+        pytest.param("duplicate", "input", "duplicate", id="duplicate-input"),
+        pytest.param("duplicate", "audio", "duplicate", id="duplicate-audio"),
+        pytest.param(
+            "duplicate",
+            "consent_confirmed",
+            "duplicate",
+            id="duplicate-consent",
+        ),
+        pytest.param(
+            "duplicate",
+            "transcript",
+            "duplicate",
+            id="duplicate-transcript",
+        ),
+        pytest.param(
+            "duplicate",
+            "language",
+            "duplicate",
+            id="duplicate-language",
+        ),
+        pytest.param(
+            "duplicate",
+            "response_format",
+            "duplicate",
+            id="duplicate-response-format",
+        ),
     ],
 )
-async def test_public_clone_preserves_worker_validation_for_unknown_and_duplicate_fields(
+async def test_public_clone_forwards_real_worker_validation_details(
     tmp_path: Path,
+    case: str,
     field_name: str,
-    duplicate: bool,
+    reason: str,
 ) -> None:
     key_file = tmp_path / "api-key"
     key_file.write_text("secret-key\n", encoding="utf-8")
@@ -451,11 +484,19 @@ async def test_public_clone_preserves_worker_validation_for_unknown_and_duplicat
         ("response_format", (None, "wav")),
         ("audio", ("reference.wav", b"PRIVATE_INVALID_AUDIO", "audio/wav")),
     ]
-    if duplicate:
+    private_value = "PRIVATE_WORKER_VALIDATION_VALUE"
+    if case == "missing":
+        parts = [part for part in parts if part[0] != field_name]
+    elif case == "invalid":
+        parts = [
+            (name, (None, private_value) if name == field_name else part)
+            for name, part in parts
+        ]
+    elif case == "duplicate":
         duplicate_part = next(part for name, part in parts if name == field_name)
         parts.append((field_name, duplicate_part))
     else:
-        parts.append((field_name, (None, "PRIVATE_FORBIDDEN_VALUE")))
+        parts.append((field_name, (None, private_value)))
 
     async with qwen_app.router.lifespan_context(qwen_app):
         async with httpx.AsyncClient(
@@ -476,10 +517,175 @@ async def test_public_clone_preserves_worker_validation_for_unknown_and_duplicat
     assert response.status_code == 422
     assert response.json()["error"] == {
         "code": "validation_error",
-        "message": "Backend request failed.",
+        "message": "Request validation failed.",
         "request_id": "req_public-field-validation",
+        "details": [{"field": field_name, "reason": reason}],
     }
-    assert "PRIVATE_FORBIDDEN_VALUE" not in response.text
+    assert private_value not in response.text
+
+
+@respx.mock
+async def test_worker_validation_details_are_forwarded_with_public_request_id(
+    app_client: httpx.AsyncClient,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    private_message = "PRIVATE_VALIDATION_MESSAGE"
+    private_request_id = "req_private-validation-worker"
+    private_value = "PRIVATE_VALIDATION_VALUE"
+    private_context = "PRIVATE_VALIDATION_CONTEXT"
+    safe_detail_marker = "private_safe_field"
+    respx.post("http://qwen-worker:8001/internal/v1/speech/clone").mock(
+        return_value=httpx.Response(
+            422,
+            json={
+                "error": {
+                    "code": "validation_error",
+                    "message": private_message,
+                    "request_id": private_request_id,
+                    "value": private_value,
+                    "context": {"marker": private_context},
+                    "details": [
+                        {"field": safe_detail_marker, "reason": "unknown"}
+                    ],
+                }
+            },
+        )
+    )
+
+    response = await app_client.post(
+        "/v1/audio/speech/clone",
+        headers=_authorization("req_public-validation"),
+        data={"input": "test", "consent_confirmed": "true"},
+        files={"audio": ("reference.wav", b"audio", "audio/wav")},
+    )
+    metrics = await app_client.get("/metrics", headers=_authorization())
+    logs = capsys.readouterr().out
+
+    assert response.status_code == 422
+    assert response.json()["error"] == {
+        "code": "validation_error",
+        "message": "Request validation failed.",
+        "request_id": "req_public-validation",
+        "details": [{"field": safe_detail_marker, "reason": "unknown"}],
+    }
+    assert private_message not in response.text
+    assert private_request_id not in response.text
+    assert private_value not in response.text
+    assert private_context not in response.text
+    assert safe_detail_marker not in metrics.text
+    assert safe_detail_marker not in logs
+
+
+@respx.mock
+async def test_worker_validation_details_are_discarded_for_other_error_codes(
+    app_client: httpx.AsyncClient,
+) -> None:
+    respx.post("http://qwen-worker:8001/internal/v1/speech/clone").mock(
+        return_value=httpx.Response(
+            422,
+            json={
+                "error": {
+                    "code": "clone_rejected",
+                    "message": "PRIVATE_OTHER_ERROR_MESSAGE",
+                    "request_id": "req_private-other-worker",
+                    "details": [{"field": "audio", "reason": "required"}],
+                }
+            },
+        )
+    )
+
+    response = await app_client.post(
+        "/v1/audio/speech/clone",
+        headers=_authorization("req_public-other-error"),
+        data={"input": "test", "consent_confirmed": "true"},
+        files={"audio": ("reference.wav", b"audio", "audio/wav")},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"] == {
+        "code": "clone_rejected",
+        "message": "Backend request failed.",
+        "request_id": "req_public-other-error",
+    }
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    "details",
+    [
+        pytest.param(
+            [{"field": "audio", "reason": "required"}] * 17,
+            id="seventeen-issues",
+        ),
+        pytest.param(
+            [{"field": "audio", "reason": "PRIVATE_REASON"}],
+            id="bad-reason",
+        ),
+        pytest.param(
+            [{"field": "unsafe-field", "reason": "required"}],
+            id="unsafe-field",
+        ),
+        pytest.param(
+            [
+                {
+                    "field": "audio",
+                    "reason": "required",
+                    "value": "PRIVATE_DETAIL_VALUE",
+                    "context": {"marker": "PRIVATE_DETAIL_CONTEXT"},
+                }
+            ],
+            id="extra-keys",
+        ),
+        pytest.param({"field": "audio", "reason": "required"}, id="non-list"),
+    ],
+)
+async def test_malicious_validation_details_are_discarded_all_or_nothing(
+    app_client: httpx.AsyncClient,
+    capsys: pytest.CaptureFixture[str],
+    details: object,
+) -> None:
+    markers = (
+        "PRIVATE_MALICIOUS_MESSAGE",
+        "req_private-malicious-worker",
+        "PRIVATE_DETAIL_VALUE",
+        "PRIVATE_DETAIL_CONTEXT",
+        "PRIVATE_REASON",
+        "unsafe-field",
+    )
+    respx.post("http://qwen-worker:8001/internal/v1/speech/clone").mock(
+        return_value=httpx.Response(
+            422,
+            json={
+                "error": {
+                    "code": "validation_error",
+                    "message": markers[0],
+                    "request_id": markers[1],
+                    "details": details,
+                }
+            },
+        )
+    )
+
+    response = await app_client.post(
+        "/v1/audio/speech/clone",
+        headers=_authorization("req_public-malicious"),
+        data={"input": "PRIVATE_FAILED_INPUT", "consent_confirmed": "true"},
+        files={"audio": ("PRIVATE_FAILED.wav", b"PRIVATE_FAILED_AUDIO", "audio/wav")},
+    )
+    metrics = await app_client.get("/metrics", headers=_authorization())
+    logs = capsys.readouterr().out
+
+    assert response.status_code == 422
+    assert response.json()["error"] == {
+        "code": "validation_error",
+        "message": "Backend request failed.",
+        "request_id": "req_public-malicious",
+    }
+    public_output = response.text + metrics.text + logs
+    assert all(marker not in public_output for marker in markers)
+    assert "PRIVATE_FAILED_INPUT" not in logs
+    assert "PRIVATE_FAILED.wav" not in logs
+    assert "PRIVATE_FAILED_AUDIO" not in logs
 
 
 @respx.mock

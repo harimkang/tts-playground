@@ -11,7 +11,9 @@ with warnings.catch_warnings():
     warnings.simplefilter("ignore", StarletteDeprecationWarning)
     from starlette.testclient import TestClient
 
+from tts_playground.common.errors import ServiceError
 from tts_playground.common.settings import GatewaySettings
+from tts_playground.common.validation import ValidationIssue
 from tts_playground.gateway.app import create_gateway_app
 from tts_playground.gateway.backends import AudioResult
 
@@ -63,6 +65,16 @@ class _UnexpectedRouter:
 class _FatalRouter:
     async def synthesize(self, _request: object, _request_id: str) -> AudioResult:
         raise BaseException("fatal marker")
+
+
+class _ValidationDetailRouter:
+    async def synthesize(self, _request: object, _request_id: str) -> AudioResult:
+        raise ServiceError(
+            status_code=422,
+            code="validation_error",
+            message="Request validation failed.",
+            details=(ValidationIssue("voice", "invalid"),),
+        )
 
 
 def test_health_is_public_and_speech_requires_auth(tmp_path: Path) -> None:
@@ -488,6 +500,32 @@ def test_validation_errors_use_public_envelope(tmp_path: Path) -> None:
             "code": "validation_error",
             "message": "Request validation failed.",
             "request_id": request_id,
+        }
+    }
+
+
+def test_service_validation_details_use_public_envelope(tmp_path: Path) -> None:
+    key = tmp_path / "key"
+    key.write_text("secret-key\n")
+    client = _create_client(key, _ValidationDetailRouter())
+    request_id = "req_service-validation"
+
+    response = client.post(
+        "/v1/audio/speech",
+        headers={
+            "Authorization": "Bearer secret-key",
+            "X-Request-ID": request_id,
+        },
+        json=_speech_body(),
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "error": {
+            "code": "validation_error",
+            "message": "Request validation failed.",
+            "request_id": request_id,
+            "details": [{"field": "voice", "reason": "invalid"}],
         }
     }
 

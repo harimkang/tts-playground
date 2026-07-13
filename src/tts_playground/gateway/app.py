@@ -23,6 +23,10 @@ from tts_playground.common.logging import (
 from tts_playground.common.models import ModelID
 from tts_playground.common.request_id import resolve_request_id
 from tts_playground.common.settings import GatewaySettings
+from tts_playground.common.validation import (
+    ValidationIssue,
+    validation_issues_to_public,
+)
 from tts_playground.gateway.auth import read_api_key, require_api_key
 from tts_playground.gateway.backends import (
     AudioResult,
@@ -85,6 +89,7 @@ def create_gateway_app(
             code=error.code,
             message=error.message,
             request_id=_request_id(request),
+            details=error.details,
         )
 
     @app.exception_handler(RequestValidationError)
@@ -411,17 +416,19 @@ def _error_response(
     message: str,
     request_id: str,
     headers: dict[str, str] | None = None,
+    details: tuple[ValidationIssue, ...] | None = None,
 ) -> JSONResponse:
+    error_content: dict[str, object] = {
+        "code": code,
+        "message": message,
+        "request_id": request_id,
+    }
+    if details is not None:
+        error_content["details"] = validation_issues_to_public(details)
     return JSONResponse(
         status_code=status_code,
         headers=headers,
-        content={
-            "error": {
-                "code": code,
-                "message": message,
-                "request_id": request_id,
-            }
-        },
+        content={"error": error_content},
     )
 
 

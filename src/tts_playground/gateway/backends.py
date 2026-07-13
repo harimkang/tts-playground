@@ -19,6 +19,7 @@ from tts_playground.common.logging import (
 )
 from tts_playground.common.models import QWEN_LANGUAGES, ModelID
 from tts_playground.common.settings import GatewaySettings
+from tts_playground.common.validation import parse_validation_issues
 from tts_playground.gateway.schemas import SpeechRequest
 
 SUPERTONIC_LANGUAGES = {
@@ -676,9 +677,20 @@ def _raise_upstream_error(response: httpx.Response) -> None:
         if isinstance(error, dict):
             code = error.get("code")
             if isinstance(code, str):
+                normalized_code = normalize_error_code(code) or "backend_error"
+                if normalized_code == "validation_error":
+                    details = parse_validation_issues(error.get("details"))
+                    if details:
+                        raise ServiceError(
+                            status_code=response.status_code,
+                            code="validation_error",
+                            message="Request validation failed.",
+                            backend_failure=True,
+                            details=details,
+                        )
                 raise ServiceError(
                     status_code=response.status_code,
-                    code=normalize_error_code(code) or "backend_error",
+                    code=normalized_code,
                     message="Backend request failed.",
                     backend_failure=True,
                 )
