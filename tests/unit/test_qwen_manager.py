@@ -48,7 +48,7 @@ class FakeAdapter:
         self.free_vram = 11 * 1024**3
         self.free_vram_calls = 0
         self.load_calls: list[str] = []
-        self.build_calls: list[str] = []
+        self.build_calls: list[tuple[Path, str | None]] = []
         self.synthesize_oom_failures = 0
         self.synthesize_failures: list[BaseException] = []
         self.load_failures: list[BaseException] = []
@@ -124,12 +124,15 @@ class FakeAdapter:
         self._record_thread("build_clone_prompt")
         assert isinstance(model, FakeModel)
         assert model.name == "base"
-        voice_id = audio_path.parent.name
-        assert transcript == "test transcript"
-        self.events.append(f"build:{voice_id}")
-        self.build_calls.append(voice_id)
+        source_name = (
+            audio_path.parent.name
+            if audio_path.parent.name.startswith("voice_")
+            else audio_path.name
+        )
+        self.events.append(f"build:{source_name}")
+        self.build_calls.append((audio_path, transcript))
         self._block_if_configured("build_clone_prompt")
-        return (voice_id, model.generation)
+        return (audio_path, transcript, model.generation)
 
     def synthesize(
         self,
@@ -203,6 +206,16 @@ def clone_request(voice_id: str) -> InternalSpeechRequest:
         text="hello",
         language="English",
         voice=voice_id,
+        instructions=None,
+    )
+
+
+def ephemeral_clone_request() -> InternalSpeechRequest:
+    return InternalSpeechRequest(
+        model=ModelID.QWEN_CLONE,
+        text="새 문장",
+        language="Korean",
+        voice=None,
         instructions=None,
     )
 
@@ -482,11 +495,19 @@ async def test_clone_prompts_are_per_voice_and_cleared_when_base_unloads(
     await manager.synthesize(clone_request(first_voice))
     await manager.synthesize(clone_request(first_voice))
     await manager.synthesize(clone_request(second_voice))
-    assert fake_adapter.build_calls == [first_voice, second_voice]
+    assert [
+        (audio_path.parent.name, transcript) for audio_path, transcript in fake_adapter.build_calls
+    ] == [(first_voice, "test transcript"), (second_voice, "test transcript")]
 
     await manager.synthesize(custom_request())
     await manager.synthesize(clone_request(first_voice))
-    assert fake_adapter.build_calls == [first_voice, second_voice, first_voice]
+    assert [
+        (audio_path.parent.name, transcript) for audio_path, transcript in fake_adapter.build_calls
+    ] == [
+        (first_voice, "test transcript"),
+        (second_voice, "test transcript"),
+        (first_voice, "test transcript"),
+    ]
 
 
 async def test_invalidate_voice_discards_its_cached_clone_prompt(
@@ -500,7 +521,143 @@ async def test_invalidate_voice_discards_its_cached_clone_prompt(
     manager.invalidate_voice(voice_id)
     await manager.synthesize(clone_request(voice_id))
 
-    assert fake_adapter.build_calls == [voice_id, voice_id]
+    assert [
+        (audio_path.parent.name, transcript) for audio_path, transcript in fake_adapter.build_calls
+    ] == [(voice_id, "test transcript"), (voice_id, "test transcript")]
+
+
+async def test_ephemeral_clone_builds_request_local_prompt_without_cache(
+    manager: QwenModelManager,
+    fake_adapter: FakeAdapter,
+    registry: VoiceRegistry,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reference = tmp_path / "reference.wav"
+    reference.write_bytes(b"normalized")
+    request = ephemeral_clone_request()
+
+    def fail_registry_lookup(voice_id: str) -> None:
+        pytest.fail(f"ephemeral clone unexpectedly looked up {voice_id}")
+
+    monkeypatch.setattr(registry, "get_internal", fail_registry_lookup)
+
+    first = await manager.synthesize_ephemeral_clone(request, reference, None)
+    second = await manager.synthesize_ephemeral_clone(request, reference, None)
+
+    assert (first.audio, second.audio) == (b"audio:base", b"audio:base")
+    assert fake_adapter.build_calls == [(reference, None), (reference, None)]
+    assert fake_adapter.load_calls == [QWEN_REPOSITORIES[ModelID.QWEN_CLONE]]
+    assert fake_adapter.events == [
+        "load:base",
+        "build:reference.wav",
+        "synthesize:base",
+        "build:reference.wav",
+        "synthesize:base",
+    ]
+
+
+async def test_ephemeral_clone_rebuilds_local_prompt_after_oom_unload(
+    manager: QwenModelManager,
+    fake_adapter: FakeAdapter,
+    tmp_path: Path,
+) -> None:
+    reference = tmp_path / "reference.wav"
+    reference.write_bytes(b"normalized")
+    fake_adapter.synthesize_oom_failures = 1
+
+    result = await manager.synthesize_ephemeral_clone(
+        ephemeral_clone_request(), reference, "원본 대사"
+    )
+
+    assert result.audio == b"audio:base"
+    assert fake_adapter.build_calls == [
+        (reference, "원본 대사"),
+        (reference, "원본 대사"),
+    ]
+    assert fake_adapter.events == [
+        "load:base",
+        "build:reference.wav",
+        "synthesize:base",
+        "cleanup",
+        "load:base",
+        "build:reference.wav",
+        "synthesize:base",
+    ]
+
+
+async def test_ephemeral_clone_cancellation_waits_for_prompt_build(
+    manager: QwenModelManager,
+    fake_adapter: FakeAdapter,
+    tmp_path: Path,
+) -> None:
+    reference = tmp_path / "reference.wav"
+    reference.write_bytes(b"normalized")
+    fake_adapter.block_call = "build_clone_prompt"
+    synthesis = asyncio.create_task(
+        manager.synthesize_ephemeral_clone(ephemeral_clone_request(), reference, None)
+    )
+    assert await asyncio.to_thread(fake_adapter.blocked_call_started.wait, 1.0)
+
+    synthesis.cancel()
+    await asyncio.sleep(0)
+    assert not synthesis.done()
+
+    fake_adapter.release_blocked_call.set()
+    with pytest.raises(asyncio.CancelledError):
+        await synthesis
+
+    assert fake_adapter.build_calls == [(reference, None)]
+    assert fake_adapter.events == ["load:base", "build:reference.wav"]
+
+
+async def test_ephemeral_and_registered_clone_share_one_active_gate_slot(
+    manager: QwenModelManager,
+    fake_adapter: FakeAdapter,
+    registry: VoiceRegistry,
+    tmp_path: Path,
+) -> None:
+    voice_id = _register_voice(registry)
+    registered_audio_path = registry.get_internal(voice_id).audio_path
+    reference = tmp_path / "reference.wav"
+    reference.write_bytes(b"normalized")
+    fake_adapter.block_synthesis = True
+    registered = asyncio.create_task(manager.synthesize(clone_request(voice_id)))
+    assert await asyncio.to_thread(fake_adapter.first_synthesis_started.wait, 1.0)
+
+    ephemeral = asyncio.create_task(
+        manager.synthesize_ephemeral_clone(ephemeral_clone_request(), reference, None)
+    )
+    for _ in range(100):
+        if manager.status().queue_depth == 1:
+            break
+        await asyncio.sleep(0)
+    else:
+        pytest.fail("ephemeral clone did not wait for the shared gate")
+
+    assert fake_adapter.build_calls == [(registered_audio_path, "test transcript")]
+
+    fake_adapter.release_synthesis.set()
+    results = await asyncio.gather(registered, ephemeral)
+
+    assert [result.audio for result in results] == [b"audio:base", b"audio:base"]
+    assert fake_adapter.build_calls == [
+        (registered_audio_path, "test transcript"),
+        (reference, None),
+    ]
+
+
+@pytest.mark.parametrize(
+    "speech_request",
+    [custom_request(), clone_request("voice_00000000000000000000000000000000")],
+)
+async def test_ephemeral_clone_rejects_non_clone_or_registered_voice_request(
+    manager: QwenModelManager,
+    speech_request: InternalSpeechRequest,
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match="Ephemeral clone requires Qwen clone without a voice ID"):
+        await manager.synthesize_ephemeral_clone(speech_request, tmp_path / "reference.wav", None)
 
 
 async def test_all_blocking_adapter_calls_run_off_the_event_loop(
@@ -602,7 +759,9 @@ async def test_cancellation_during_clone_prompt_stops_before_synthesis(
         await synthesis
 
     assert fake_adapter.events == ["load:base", f"build:{voice_id}"]
-    assert fake_adapter.build_calls == [voice_id]
+    assert [
+        (audio_path.parent.name, transcript) for audio_path, transcript in fake_adapter.build_calls
+    ] == [(voice_id, "test transcript")]
     assert manager.status().loaded_model == ModelID.QWEN_CLONE
 
 

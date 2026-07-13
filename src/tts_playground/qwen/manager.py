@@ -5,6 +5,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
+from pathlib import Path
 
 from tts_playground.common.errors import ServiceError
 from tts_playground.common.models import QWEN_REPOSITORIES, ModelID
@@ -33,6 +34,12 @@ class WorkerStatus:
     loaded_model: ModelID | None
     queue_depth: int
     last_error_code: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _EphemeralCloneSource:
+    audio_path: Path
+    transcript: str | None
 
 
 class QwenModelManager:
@@ -65,6 +72,19 @@ class QwenModelManager:
             checkpoint = _CancellationCheckpoint()
             return await self._synthesize_locked(request, checkpoint)
 
+    async def synthesize_ephemeral_clone(
+        self,
+        request: InternalSpeechRequest,
+        audio_path: Path,
+        transcript: str | None,
+    ) -> SynthesisResult:
+        if request.model != ModelID.QWEN_CLONE or request.voice is not None:
+            raise ValueError("Ephemeral clone requires Qwen clone without a voice ID")
+        source = _EphemeralCloneSource(audio_path, transcript)
+        async with self._gate.slot():
+            checkpoint = _CancellationCheckpoint()
+            return await self._synthesize_locked(request, checkpoint, source)
+
     async def unload_if_idle(self) -> None:
         if not self._is_idle_unload_due():
             return
@@ -88,10 +108,7 @@ class QwenModelManager:
             return False
         if self._error_started_at is None:
             raise AssertionError("ERROR state requires a cooldown start time")
-        return (
-            self._monotonic() - self._error_started_at
-            < self._settings.error_cooldown_seconds
-        )
+        return self._monotonic() - self._error_started_at < self._settings.error_cooldown_seconds
 
     async def shutdown(self) -> None:
         async with self._gate.slot():
@@ -102,6 +119,7 @@ class QwenModelManager:
         self,
         request: InternalSpeechRequest,
         checkpoint: _CancellationCheckpoint,
+        source: _EphemeralCloneSource | None = None,
     ) -> SynthesisResult:
         self._recover_from_error_or_raise()
         for attempt in range(2):
@@ -111,7 +129,7 @@ class QwenModelManager:
             try:
                 model = await self._ensure_model(request.model, checkpoint)
                 self._touch_resident_model()
-                clone_prompt = await self._clone_prompt(model, request, checkpoint)
+                clone_prompt = await self._clone_prompt(model, request, checkpoint, source)
                 result = await checkpoint.run(
                     self._adapter.synthesize,
                     model,
@@ -244,9 +262,19 @@ class QwenModelManager:
         model: object,
         request: InternalSpeechRequest,
         checkpoint: _CancellationCheckpoint,
+        source: _EphemeralCloneSource | None,
     ) -> object | None:
         if request.model != ModelID.QWEN_CLONE:
             return None
+        if source is not None:
+            prompt = await checkpoint.run(
+                self._adapter.build_clone_prompt,
+                model,
+                source.audio_path,
+                source.transcript,
+            )
+            checkpoint.raise_if_requested()
+            return prompt
         if request.voice is None:
             raise ServiceError(
                 status_code=422,
