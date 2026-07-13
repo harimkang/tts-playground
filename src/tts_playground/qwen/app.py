@@ -243,7 +243,7 @@ def create_qwen_app(settings: QwenSettings, adapter: QwenAdapter) -> FastAPI:
             normalized_transcript = normalize_optional_transcript(transcript)
             with tempfile.TemporaryDirectory(prefix="qwen-clone-", dir="/tmp") as directory:
                 audio_path = Path(directory) / "reference.wav"
-                await asyncio.to_thread(normalize_reference_audio, audio_bytes, audio_path)
+                await _normalize_reference_audio_to_completion(audio_bytes, audio_path)
                 internal = InternalSpeechRequest(
                     model=ModelID.QWEN_CLONE,
                     text=input,
@@ -321,6 +321,27 @@ async def _read_bounded_upload(audio: UploadFile) -> bytes:
                 message="Reference audio exceeds the 20 MB limit.",
             )
     return bytes(content)
+
+
+async def _normalize_reference_audio_to_completion(
+    audio: bytes,
+    destination: Path,
+) -> float:
+    task = asyncio.create_task(
+        asyncio.to_thread(normalize_reference_audio, audio, destination)
+    )
+    cancellation_requested = False
+    while True:
+        try:
+            result = await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancellation_requested = True
+            if not task.done():
+                continue
+            result = task.result()
+        if cancellation_requested:
+            raise asyncio.CancelledError
+        return result
 
 
 async def _observe_synthesis(

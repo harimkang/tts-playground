@@ -517,6 +517,59 @@ async def test_ephemeral_clone_cancellation_waits_for_build_before_cleanup(
             assert not temporary_path.exists()
 
 
+async def test_ephemeral_clone_cancellation_waits_for_normalization_before_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    normalization_started = threading.Event()
+    release_normalization = threading.Event()
+    temporary_paths: list[Path] = []
+
+    def blocking_normalizer(_audio: bytes, destination: Path) -> float:
+        temporary_paths.append(destination)
+        destination.write_bytes(b"normalization in progress")
+        normalization_started.set()
+        if not release_normalization.wait(timeout=2.0):
+            raise AssertionError("test did not release blocked normalization")
+        return 4.0
+
+    monkeypatch.setattr(
+        "tts_playground.qwen.app.normalize_reference_audio",
+        blocking_normalizer,
+    )
+    app = create_qwen_app(_settings(tmp_path), FakeAdapter())
+    transport = httpx.ASGITransport(app=app)
+
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            request_task = asyncio.create_task(
+                client.post(
+                    "/internal/v1/speech/clone",
+                    data=_clone_form(),
+                    files={"audio": ("private.wav", _wav_bytes(), "audio/wav")},
+                )
+            )
+            assert await asyncio.to_thread(normalization_started.wait, 1.0)
+            temporary_path = temporary_paths[0]
+            assert temporary_path.exists()
+
+            request_task.cancel()
+            await asyncio.sleep(0.05)
+            cancellation_waited = not request_task.done()
+            path_remained = temporary_path.exists()
+            directory_remained = temporary_path.parent.exists()
+
+            release_normalization.set()
+            with pytest.raises(asyncio.CancelledError):
+                await request_task
+
+            assert cancellation_waited
+            assert path_remained
+            assert directory_remained
+            assert not temporary_path.exists()
+            assert not temporary_path.parent.exists()
+
+
 def test_ephemeral_clone_metrics_record_success_and_sanitized_failure(tmp_path: Path) -> None:
     adapter = FakeAdapter()
     app = create_qwen_app(_settings(tmp_path), adapter)
