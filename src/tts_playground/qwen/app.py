@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import tempfile
+from collections import Counter
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
@@ -20,6 +21,13 @@ from tts_playground.common.errors import ServiceError
 from tts_playground.common.models import QWEN_LANGUAGES, ModelID
 from tts_playground.common.request_id import resolve_request_id
 from tts_playground.common.settings import QwenSettings
+from tts_playground.common.validation import (
+    MAX_VALIDATION_ISSUES,
+    ValidationIssue,
+    ValidationReason,
+    sanitize_field_identifier,
+    validation_issues_to_public,
+)
 from tts_playground.qwen.adapter import (
     InternalSpeechRequest,
     QwenAdapter,
@@ -137,18 +145,23 @@ def create_qwen_app(settings: QwenSettings, adapter: QwenAdapter) -> FastAPI:
             code=error.code,
             message=error.message,
             request_id=_request_id(request),
+            details=error.details,
         )
 
     @app.exception_handler(RequestValidationError)
     async def validation_error_handler(
         request: Request,
-        _error: RequestValidationError,
+        error: RequestValidationError,
     ) -> JSONResponse:
+        details = None
+        if request.url.path == "/internal/v1/speech/clone":
+            details = _request_validation_issues(error)
         return _error_response(
             status_code=422,
             code="validation_error",
             message="Request validation failed.",
             request_id=_request_id(request),
+            details=details,
         )
 
     @app.exception_handler(HTTPException)
@@ -324,14 +337,21 @@ def create_qwen_app(settings: QwenSettings, adapter: QwenAdapter) -> FastAPI:
 async def _validate_ephemeral_clone_fields(request: Request) -> None:
     form = await request.form()
     field_names = [name for name, _value in form.multi_items()]
-    if (
-        any(name not in _EPHEMERAL_CLONE_FIELDS for name in field_names)
-        or len(field_names) != len(set(field_names))
-    ):
+    field_counts = Counter(field_names)
+    issues: list[ValidationIssue] = []
+    for name in dict.fromkeys(field_names):
+        if name not in _EPHEMERAL_CLONE_FIELDS:
+            issues.append(ValidationIssue(sanitize_field_identifier(name), "unknown"))
+        elif field_counts[name] > 1:
+            issues.append(ValidationIssue(name, "duplicate"))
+        if len(issues) == MAX_VALIDATION_ISSUES:
+            break
+    if issues:
         raise ServiceError(
             status_code=422,
             code="validation_error",
             message="Request validation failed.",
+            details=tuple(issues),
         )
 
 
@@ -470,6 +490,24 @@ def _request_id(request: Request) -> str:
     return resolve_request_id(None)
 
 
+def _request_validation_issues(
+    error: RequestValidationError,
+) -> tuple[ValidationIssue, ...]:
+    issues: list[ValidationIssue] = []
+    for item in error.errors()[:MAX_VALIDATION_ISSUES]:
+        location = item.get("loc")
+        field = (
+            location[-1]
+            if isinstance(location, tuple | list) and location
+            else "unknown"
+        )
+        reason: ValidationReason = (
+            "required" if item.get("type") == "missing" else "invalid"
+        )
+        issues.append(ValidationIssue(sanitize_field_identifier(field), reason))
+    return tuple(issues)
+
+
 def _error_response(
     *,
     status_code: int,
@@ -477,17 +515,19 @@ def _error_response(
     message: str,
     request_id: str,
     headers: Mapping[str, str] | None = None,
+    details: tuple[ValidationIssue, ...] | None = None,
 ) -> JSONResponse:
+    error_content: dict[str, object] = {
+        "code": code,
+        "message": message,
+        "request_id": request_id,
+    }
+    if details is not None:
+        error_content["details"] = validation_issues_to_public(details)
     return JSONResponse(
         status_code=status_code,
         headers=headers,
-        content={
-            "error": {
-                "code": code,
-                "message": message,
-                "request_id": request_id,
-            }
-        },
+        content={"error": error_content},
     )
 
 

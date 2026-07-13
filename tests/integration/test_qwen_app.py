@@ -131,6 +131,22 @@ def _clone_multipart_parts() -> list[tuple[str, tuple[None, str] | tuple[str, by
     ]
 
 
+def _assert_clone_validation_details(
+    response: httpx.Response,
+    request_id: str,
+    details: list[dict[str, str]],
+) -> None:
+    assert response.status_code == 422
+    assert response.json() == {
+        "error": {
+            "code": "validation_error",
+            "message": "Request validation failed.",
+            "request_id": request_id,
+            "details": details,
+        }
+    }
+
+
 def _registry_files(voice_data_dir: Path) -> set[Path]:
     return {
         path.relative_to(voice_data_dir)
@@ -456,6 +472,77 @@ def test_ephemeral_clone_requires_consent_before_prompt_build(tmp_path: Path) ->
     assert adapter.build_calls == []
 
 
+@pytest.mark.parametrize("field_name", ["input", "audio", "consent_confirmed"])
+def test_ephemeral_clone_validation_detail_identifies_missing_required_field(
+    tmp_path: Path,
+    field_name: str,
+) -> None:
+    adapter = FakeAdapter()
+    app = create_qwen_app(_settings(tmp_path), adapter)
+    request_id = f"req_missing-{field_name}"
+    form = _clone_form()
+    files: dict[str, tuple[str, bytes, str]] = {
+        "audio": ("private-name.wav", _wav_bytes(), "audio/wav")
+    }
+    if field_name == "audio":
+        files.clear()
+    else:
+        form.pop(field_name)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/internal/v1/speech/clone",
+            headers={"X-Request-ID": request_id},
+            data=form,
+            files=files,
+        )
+
+    _assert_clone_validation_details(
+        response,
+        request_id,
+        [{"field": field_name, "reason": "required"}],
+    )
+    assert adapter.build_calls == []
+
+
+@pytest.mark.parametrize(
+    ("field_name", "invalid_value"),
+    [
+        pytest.param("input", "x" * 2001, id="input-length"),
+        pytest.param("consent_confirmed", "not-a-boolean", id="consent-confirmed"),
+        pytest.param("language", "x", id="language"),
+        pytest.param("response_format", "mp3", id="response-format"),
+        pytest.param("transcript", "x" * 4001, id="transcript-length"),
+    ],
+)
+def test_ephemeral_clone_validation_detail_identifies_invalid_field(
+    tmp_path: Path,
+    field_name: str,
+    invalid_value: str,
+) -> None:
+    adapter = FakeAdapter()
+    app = create_qwen_app(_settings(tmp_path), adapter)
+    request_id = f"req_invalid-{field_name}"
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/internal/v1/speech/clone",
+            headers={"X-Request-ID": request_id},
+            data=_clone_form(**{field_name: invalid_value}),
+            files={"audio": ("private-name.wav", _wav_bytes(), "audio/wav")},
+        )
+
+    _assert_clone_validation_details(
+        response,
+        request_id,
+        [{"field": field_name, "reason": "invalid"}],
+    )
+    assert "msg" not in response.text
+    assert "ctx" not in response.text
+    assert invalid_value not in response.text
+    assert adapter.build_calls == []
+
+
 @pytest.mark.parametrize(
     "field_name",
     ["voice", "instructions", "speed", "steps", "unknown_private_field"],
@@ -467,17 +554,25 @@ def test_ephemeral_clone_rejects_unknown_fields_before_prompt_build(
     adapter = FakeAdapter()
     settings = _settings(tmp_path)
     app = create_qwen_app(settings, adapter)
+    request_id = f"req_unknown-{field_name}"
     parts = _clone_multipart_parts()
     private_value = "PRIVATE_UNKNOWN_FIELD_VALUE"
     parts.append((field_name, (None, private_value)))
 
     with TestClient(app) as client:
         files_before = _registry_files(settings.voice_data_dir)
-        response = client.post("/internal/v1/speech/clone", files=parts)
+        response = client.post(
+            "/internal/v1/speech/clone",
+            headers={"X-Request-ID": request_id},
+            files=parts,
+        )
         files_after = _registry_files(settings.voice_data_dir)
 
-    assert response.status_code == 422
-    assert response.json()["error"]["code"] == "validation_error"
+    _assert_clone_validation_details(
+        response,
+        request_id,
+        [{"field": field_name, "reason": "unknown"}],
+    )
     assert private_value not in response.text
     assert adapter.build_calls == []
     assert files_before == files_after
@@ -501,19 +596,113 @@ def test_ephemeral_clone_rejects_duplicate_singular_fields_before_prompt_build(
     adapter = FakeAdapter()
     settings = _settings(tmp_path)
     app = create_qwen_app(settings, adapter)
+    request_id = f"req_duplicate-{field_name}"
     parts = _clone_multipart_parts()
     duplicate = next(part for name, part in parts if name == field_name)
     parts.append((field_name, duplicate))
 
     with TestClient(app) as client:
         files_before = _registry_files(settings.voice_data_dir)
-        response = client.post("/internal/v1/speech/clone", files=parts)
+        response = client.post(
+            "/internal/v1/speech/clone",
+            headers={"X-Request-ID": request_id},
+            files=parts,
+        )
         files_after = _registry_files(settings.voice_data_dir)
 
-    assert response.status_code == 422
-    assert response.json()["error"]["code"] == "validation_error"
+    _assert_clone_validation_details(
+        response,
+        request_id,
+        [{"field": field_name, "reason": "duplicate"}],
+    )
     assert adapter.build_calls == []
     assert files_before == files_after
+
+
+def test_ephemeral_clone_unknown_fields_are_sanitized_bounded_and_private(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    adapter = FakeAdapter()
+    app = create_qwen_app(_settings(tmp_path), adapter)
+    request_id = "req_sanitized-fields"
+    private_field_names = ("private-field", "비공개", "a" * 65)
+    private_value = "PRIVATE_UNKNOWN_VALUE"
+    private_filename = "PRIVATE_CLIENT_FILENAME.wav"
+    parts = _clone_multipart_parts()
+    parts[-1] = ("audio", (private_filename, _wav_bytes(), "audio/wav"))
+    parts.extend((name, (None, private_value)) for name in private_field_names)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/internal/v1/speech/clone",
+            headers={"X-Request-ID": request_id},
+            files=parts,
+        )
+
+    _assert_clone_validation_details(
+        response,
+        request_id,
+        [{"field": "unknown", "reason": "unknown"}] * 3,
+    )
+    captured = capsys.readouterr()
+    public_output = response.text + caplog.text + captured.out + captured.err
+    assert all(name not in public_output for name in private_field_names)
+    assert private_value not in public_output
+    assert private_filename not in public_output
+    assert adapter.build_calls == []
+
+
+def test_ephemeral_clone_unknown_fields_are_deterministically_capped_at_16(
+    tmp_path: Path,
+) -> None:
+    adapter = FakeAdapter()
+    app = create_qwen_app(_settings(tmp_path), adapter)
+    request_id = "req_bounded-fields"
+    parts = _clone_multipart_parts()
+    unknown_names = [f"private_{index:02d}" for index in range(18)]
+    parts.extend((name, (None, "private value")) for name in unknown_names)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/internal/v1/speech/clone",
+            headers={"X-Request-ID": request_id},
+            files=parts,
+        )
+
+    _assert_clone_validation_details(
+        response,
+        request_id,
+        [
+            {"field": name, "reason": "unknown"}
+            for name in unknown_names[:16]
+        ],
+    )
+    assert adapter.build_calls == []
+
+
+def test_non_clone_validation_error_has_no_details(tmp_path: Path) -> None:
+    app = create_qwen_app(_settings(tmp_path), FakeAdapter())
+    request_id = "req_non-clone-validation"
+    body = _speech_body()
+    body.pop("text")
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/internal/v1/speech",
+            headers={"X-Request-ID": request_id},
+            json=body,
+        )
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "error": {
+            "code": "validation_error",
+            "message": "Request validation failed.",
+            "request_id": request_id,
+        }
+    }
 
 
 @pytest.mark.parametrize("failure_stage", ["build", "synthesis"])
