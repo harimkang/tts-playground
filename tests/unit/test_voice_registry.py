@@ -119,6 +119,28 @@ def test_registry_persists_normalized_audio_without_exposing_secrets(
     assert reloaded.list_public() == [created]
 
 
+@pytest.mark.parametrize("transcript", [None, "", "   "])
+def test_registration_normalizes_missing_or_blank_transcript_to_none(
+    tmp_path: Path,
+    transcript: str | None,
+) -> None:
+    registry = VoiceRegistry(tmp_path / "voices")
+    public = registry.register(
+        name="optional transcript",
+        audio=_wav_bytes(4),
+        transcript=transcript,
+        language="ko",
+        consent_confirmed=True,
+    )
+
+    assert registry.get_internal(public.id).transcript is None
+    metadata = json.loads(
+        (tmp_path / "voices" / public.id / "metadata.json").read_text()
+    )
+    assert metadata["transcript"] is None
+    assert VoiceRegistry(tmp_path / "voices").get_internal(public.id).transcript is None
+
+
 def test_delete_removes_only_the_opaque_voice_directory(
     tmp_path: Path,
     wav_bytes: bytes,

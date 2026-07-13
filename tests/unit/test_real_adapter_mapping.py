@@ -132,22 +132,24 @@ def test_voice_design_maps_to_qwen_package(adapter: QwenTTSAdapter) -> None:
     )
 
 
-def test_build_clone_prompt_maps_to_qwen_package(
+@pytest.mark.parametrize(
+    ("transcript", "x_vector_only_mode"),
+    [("정확한 녹취", False), (None, True)],
+)
+def test_build_clone_prompt_selects_mode_from_transcript(
     adapter: QwenTTSAdapter,
-    tmp_path: Path,
+    transcript: str | None,
+    x_vector_only_mode: bool,
 ) -> None:
     model = Mock()
-    prompt = object()
-    model.create_voice_clone_prompt.return_value = prompt
-    audio_path = tmp_path / "reference.wav"
+    audio_path = Path("/tmp/reference.wav")
 
-    result = adapter.build_clone_prompt(model, audio_path, "정확한 녹취")
+    adapter.build_clone_prompt(model, audio_path, transcript)
 
-    assert result is prompt
     model.create_voice_clone_prompt.assert_called_once_with(
         ref_audio=str(audio_path),
-        ref_text="정확한 녹취",
-        x_vector_only_mode=False,
+        ref_text=transcript,
+        x_vector_only_mode=x_vector_only_mode,
     )
 
 

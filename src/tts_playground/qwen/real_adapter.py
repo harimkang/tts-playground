@@ -65,7 +65,7 @@ class _QwenModel(Protocol):
         self,
         *,
         ref_audio: str,
-        ref_text: str,
+        ref_text: str | None,
         x_vector_only_mode: bool,
     ) -> object: ...
 
@@ -118,14 +118,14 @@ class QwenTTSAdapter:
         self,
         model: object,
         audio_path: Path,
-        transcript: str,
+        transcript: str | None,
     ) -> object:
         qwen_model = cast(_QwenModel, model)
         return self._with_oom_conversion(
             qwen_model.create_voice_clone_prompt,
             ref_audio=str(audio_path),
             ref_text=transcript,
-            x_vector_only_mode=False,
+            x_vector_only_mode=transcript is None,
         )
 
     def synthesize(

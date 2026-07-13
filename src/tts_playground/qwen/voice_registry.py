@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import io
 import json
 import os
 import re
@@ -12,20 +11,33 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from math import isfinite
 from pathlib import Path
-from typing import Final, Protocol, cast
-
-import soundfile as sf  # type: ignore[import-untyped]
+from typing import Final
 
 from tts_playground.common.errors import ServiceError
+from tts_playground.qwen.reference_audio import (
+    MAX_AUDIO_BYTES as MAX_AUDIO_BYTES,
+)
+from tts_playground.qwen.reference_audio import (
+    MAX_AUDIO_CHANNELS as MAX_AUDIO_CHANNELS,
+)
+from tts_playground.qwen.reference_audio import (
+    MAX_AUDIO_SAMPLE_RATE as MAX_AUDIO_SAMPLE_RATE,
+)
+from tts_playground.qwen.reference_audio import (
+    MAX_AUDIO_SECONDS as MAX_AUDIO_SECONDS,
+)
+from tts_playground.qwen.reference_audio import (
+    MAX_DECODED_SAMPLES as MAX_DECODED_SAMPLES,
+)
+from tts_playground.qwen.reference_audio import (
+    MIN_AUDIO_SECONDS as MIN_AUDIO_SECONDS,
+)
+from tts_playground.qwen.reference_audio import (
+    normalize_optional_transcript,
+    normalize_reference_audio,
+)
 
-MAX_AUDIO_BYTES: Final = 20 * 1024 * 1024
-MIN_AUDIO_SECONDS: Final = 3.0
-MAX_AUDIO_SECONDS: Final = 30.0
-MAX_AUDIO_CHANNELS: Final = 2
-MAX_AUDIO_SAMPLE_RATE: Final = 192_000
-MAX_DECODED_SAMPLES: Final = 6_000_000
 _VOICE_ID_PATTERN: Final = re.compile(r"voice_[0-9a-f]{32}")
-_SUPPORTED_AUDIO_FORMATS: Final = frozenset({"FLAC", "WAV"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,15 +58,8 @@ class VoiceInternal:
     duration_seconds: float
     consent_confirmed: bool
     created_at: str
-    transcript: str
+    transcript: str | None
     audio_path: Path
-
-
-class _AudioMetadata(Protocol):
-    format: str
-    frames: int
-    samplerate: int
-    channels: int
 
 
 class VoiceRegistry:
@@ -70,7 +75,7 @@ class VoiceRegistry:
         *,
         name: str,
         audio: bytes,
-        transcript: str,
+        transcript: str | None,
         language: str,
         consent_confirmed: bool,
     ) -> VoicePublic:
@@ -80,31 +85,7 @@ class VoiceRegistry:
                 code="consent_required",
                 message="Consent confirmation is required.",
             )
-        if len(audio) > MAX_AUDIO_BYTES:
-            raise ServiceError(
-                status_code=413,
-                code="audio_too_large",
-                message="Reference audio exceeds the 20 MB limit.",
-            )
-
-        audio_stream = io.BytesIO(audio)
-        try:
-            audio_info = sf.info(audio_stream)
-        except (sf.LibsndfileError, RuntimeError, TypeError, ValueError):
-            raise _invalid_audio() from None
-
-        duration_seconds = _validate_audio_metadata(audio_info)
-        try:
-            audio_stream.seek(0)
-            samples, sample_rate = sf.read(
-                audio_stream,
-                dtype="float32",
-                always_2d=True,
-            )
-        except (sf.LibsndfileError, RuntimeError, TypeError, ValueError):
-            raise _invalid_audio() from None
-        if sample_rate != audio_info.samplerate:
-            raise _invalid_audio()
+        transcript = normalize_optional_transcript(transcript)
 
         voice_id = f"voice_{uuid.uuid4().hex}"
         created_at = datetime.now(UTC).isoformat()
@@ -113,13 +94,7 @@ class VoiceRegistry:
         published = False
         try:
             audio_path = staging_directory / "reference.wav"
-            sf.write(
-                audio_path,
-                samples,
-                sample_rate,
-                format="WAV",
-                subtype="PCM_16",
-            )
+            duration_seconds = normalize_reference_audio(audio, audio_path)
             _fsync_file(audio_path)
 
             metadata = {
@@ -234,8 +209,11 @@ def _load_voice(voice_directory: Path) -> VoiceInternal | None:
 
     if voice_id != voice_directory.name or not isinstance(voice_id, str):
         return None
-    if not all(isinstance(value, str) for value in (name, language, transcript, created_at)):
+    if not all(isinstance(value, str) for value in (name, language, created_at)):
         return None
+    if transcript is not None and not isinstance(transcript, str):
+        return None
+    transcript = normalize_optional_transcript(transcript)
     if isinstance(duration_seconds, bool) or not isinstance(duration_seconds, int | float):
         return None
     try:
@@ -292,50 +270,6 @@ def _voice_not_found() -> ServiceError:
         status_code=404,
         code="voice_not_found",
         message="Voice not found.",
-    )
-
-
-def _validate_audio_metadata(audio_info: object) -> float:
-    metadata = cast(_AudioMetadata, audio_info)
-    try:
-        audio_format = metadata.format
-        frames = metadata.frames
-        sample_rate = metadata.samplerate
-        channels = metadata.channels
-    except (AttributeError, TypeError, ValueError):
-        raise _invalid_audio() from None
-    if audio_format not in _SUPPORTED_AUDIO_FORMATS:
-        raise _invalid_audio()
-    numeric_metadata = (frames, sample_rate, channels)
-    if any(
-        isinstance(value, bool) or not isinstance(value, int)
-        for value in numeric_metadata
-    ):
-        raise _invalid_audio()
-    if frames <= 0 or sample_rate <= 0 or channels <= 0:
-        raise _invalid_audio()
-
-    duration_seconds = frames / sample_rate
-    if not MIN_AUDIO_SECONDS <= duration_seconds <= MAX_AUDIO_SECONDS:
-        raise ServiceError(
-            status_code=422,
-            code="invalid_audio_duration",
-            message="Reference audio must be between 3 and 30 seconds.",
-        )
-    if (
-        channels > MAX_AUDIO_CHANNELS
-        or sample_rate > MAX_AUDIO_SAMPLE_RATE
-        or frames * channels > MAX_DECODED_SAMPLES
-    ):
-        raise _invalid_audio()
-    return duration_seconds
-
-
-def _invalid_audio() -> ServiceError:
-    return ServiceError(
-        status_code=400,
-        code="invalid_audio",
-        message="Reference audio is invalid.",
     )
 
 

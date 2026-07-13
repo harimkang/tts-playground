@@ -119,7 +119,7 @@ class FakeAdapter:
         self,
         model: object,
         audio_path: Path,
-        transcript: str,
+        transcript: str | None,
     ) -> object:
         self._record_thread("build_clone_prompt")
         assert isinstance(model, FakeModel)

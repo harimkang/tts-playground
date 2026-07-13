@@ -26,6 +26,7 @@ from tts_playground.qwen.adapter import (
 from tts_playground.qwen.manager import QwenModelManager
 from tts_playground.qwen.metrics import QwenMetrics
 from tts_playground.qwen.real_adapter import QwenTTSAdapter
+from tts_playground.qwen.reference_audio import normalize_optional_transcript
 from tts_playground.qwen.schemas import (
     QwenSpeechRequest,
     VoiceResponse,
@@ -57,7 +58,7 @@ class _ObservedAdapter:
         self,
         model: object,
         audio_path: Path,
-        transcript: str,
+        transcript: str | None,
     ) -> object:
         return self._adapter.build_clone_prompt(model, audio_path, transcript)
 
@@ -248,16 +249,16 @@ def create_qwen_app(settings: QwenSettings, adapter: QwenAdapter) -> FastAPI:
         request: Request,
         name: Annotated[str, Form(min_length=1, max_length=100)],
         audio: Annotated[UploadFile, File()],
-        transcript: Annotated[str, Form(min_length=1, max_length=4000)],
         language: Annotated[str, Form(min_length=2, max_length=10)],
         consent_confirmed: Annotated[bool, Form()],
+        transcript: Annotated[str | None, Form(max_length=4000)] = None,
     ) -> VoiceResponse:
         audio_bytes = await _read_bounded_upload(audio)
         voice = await asyncio.to_thread(
             _registry(request).register,
             name=name,
             audio=audio_bytes,
-            transcript=transcript,
+            transcript=normalize_optional_transcript(transcript),
             language=language,
             consent_confirmed=consent_confirmed,
         )

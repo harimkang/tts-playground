@@ -47,7 +47,7 @@ class FakeAdapter:
         self,
         model: object,
         audio_path: Path,
-        transcript: str,
+        transcript: str | None,
     ) -> object:
         return (str(audio_path), transcript)
 
@@ -289,6 +289,45 @@ def test_voice_registration_list_detail_and_delete(tmp_path: Path) -> None:
     assert deleted.content == b""
     assert missing.status_code == 404
     assert missing.json()["error"]["code"] == "voice_not_found"
+
+
+@pytest.mark.parametrize(
+    ("transcript", "expected_transcript"),
+    [
+        pytest.param(None, None, id="omitted"),
+        pytest.param("", None, id="empty"),
+        pytest.param("   ", None, id="whitespace"),
+        pytest.param("  exact transcript  ", "  exact transcript  ", id="nonblank"),
+    ],
+)
+def test_voice_registration_accepts_optional_transcript(
+    tmp_path: Path,
+    transcript: str | None,
+    expected_transcript: str | None,
+) -> None:
+    app = create_qwen_app(_settings(tmp_path), FakeAdapter())
+    form_data = {
+        "name": "optional transcript",
+        "language": "en",
+        "consent_confirmed": "true",
+    }
+    if transcript is not None:
+        form_data["transcript"] = transcript
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/internal/v1/voices",
+            data=form_data,
+            files={"audio": ("reference.wav", _wav_bytes(), "audio/wav")},
+        )
+        assert response.status_code == 201
+        voice_id = response.json()["id"]
+        assert app.state.voice_registry.get_internal(voice_id).transcript == (
+            expected_transcript
+        )
+
+    assert "transcript" not in response.json()
+    assert "audio_path" not in response.json()
 
 
 def test_voice_registration_rejects_more_than_20_mb_before_audio_parsing(

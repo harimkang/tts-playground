@@ -39,7 +39,7 @@ class QwenAdapter(Protocol):
         self,
         model: object,
         audio_path: Path,
-        transcript: str,
+        transcript: str | None,
     ) -> object:
         raise NotImplementedError
 
