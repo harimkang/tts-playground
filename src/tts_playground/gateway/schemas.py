@@ -5,6 +5,22 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from tts_playground.common.models import QWEN_CUSTOM_SPEAKERS, ModelID
 
 
+class ValidationDetail(BaseModel):
+    field: str
+    reason: Literal["required", "invalid", "duplicate", "unknown"]
+
+
+class ErrorBody(BaseModel):
+    code: str
+    message: str
+    request_id: str
+    details: list[ValidationDetail] | None = None
+
+
+class ErrorEnvelope(BaseModel):
+    error: ErrorBody
+
+
 class SpeechRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

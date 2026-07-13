@@ -112,6 +112,22 @@ def test_docs_cover_registered_and_ephemeral_clone_lifecycles() -> None:
         assert ("-F 'transcript=" in code) is includes_transcript
 
 
+def test_readme_documents_discoverable_ephemeral_clone_contract() -> None:
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+
+    required_fragments = (
+        "/docs",
+        "/openapi.json",
+        "`input`, `audio`, and `consent_confirmed` are required",
+        "`transcript`, `language`, and `response_format` are optional",
+        '"details": [',
+        '"field": "audio"',
+        '"reason": "required"',
+        "Field values and backend text are intentionally omitted",
+    )
+    assert all(fragment in readme for fragment in required_fragments)
+
+
 def test_readme_enumerates_public_error_codes() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     public_error_codes = {

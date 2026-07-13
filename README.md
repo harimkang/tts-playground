@@ -110,6 +110,9 @@ Logs intentionally exclude bearer tokens, input text, instructions, transcripts,
 
 All synthesis calls return WAV bytes. These examples assume `TTS_BASE_URL`, `TTS_API_KEY`, and (for clone use) `VOICE_ID` are already set.
 
+Interactive API documentation is available at `$TTS_BASE_URL/docs`, and the machine-readable
+OpenAPI schema is available at `$TTS_BASE_URL/openapi.json`.
+
 Supertonic 3, with its supported speed and step controls:
 
 ```sh
@@ -196,6 +199,13 @@ curl --fail --silent --show-error -X DELETE \
 
 `POST /v1/audio/speech/clone` performs a one-request clone without creating a voice ID. Ephemeral clone, text-assisted:
 
+Its multipart contract has exactly six fields:
+`input`, `audio`, and `consent_confirmed` are required;
+`transcript`, `language`, and `response_format` are optional. `input` contains 1-2,000
+characters, `audio` is the binary reference upload, and `consent_confirmed` is a boolean that must
+be true. `transcript` is at most 4,000 characters, `language` contains 2-10 characters and defaults
+to `auto`, and `response_format` must be `wav` and defaults to `wav`.
+
 ```sh
 curl --fail --silent --show-error \
   -H "Authorization: Bearer $TTS_API_KEY" \
@@ -224,6 +234,24 @@ Ephemeral references are not persisted: they are never added to the registry or 
 ## Errors and Qwen switching
 
 JSON errors contain `error.code`, a safe message, and `request_id`. The public codes implemented by the gateway and the errors it safely forwards from its private workers are:
+
+Validation errors may also include safe field-only details:
+
+```json
+{
+  "error": {
+    "code": "validation_error",
+    "message": "Request validation failed.",
+    "request_id": "req_...",
+    "details": [
+      {"field": "audio", "reason": "required"}
+    ]
+  }
+}
+```
+
+Reasons are limited to `required`, `invalid`, `duplicate`, and `unknown`.
+Field values and backend text are intentionally omitted.
 
 | HTTP | Code | Operator meaning |
 | ---: | --- | --- |

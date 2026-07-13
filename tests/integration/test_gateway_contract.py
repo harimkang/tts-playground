@@ -40,6 +40,87 @@ def _speech_body() -> dict[str, object]:
     }
 
 
+def test_ephemeral_clone_openapi_is_exact_and_documentation_only(tmp_path: Path) -> None:
+    key = tmp_path / "key"
+    key.write_text("secret-key\n")
+    app = create_gateway_app(
+        GatewaySettings(api_key_file=key),
+        backend_router=None,
+    )
+    client = TestClient(app)
+
+    schema = client.get("/openapi.json").json()
+    operation = schema["paths"]["/v1/audio/speech/clone"]["post"]
+    request_body = operation["requestBody"]
+    multipart = request_body["content"]["multipart/form-data"]["schema"]
+
+    assert request_body["required"] is True
+    assert multipart["type"] == "object"
+    assert multipart["additionalProperties"] is False
+    assert multipart["required"] == ["input", "audio", "consent_confirmed"]
+    assert multipart["properties"] == {
+        "input": {"type": "string", "minLength": 1, "maxLength": 2000},
+        "audio": {"type": "string", "format": "binary"},
+        "consent_confirmed": {"type": "boolean"},
+        "transcript": {"type": "string", "maxLength": 4000},
+        "language": {
+            "type": "string",
+            "minLength": 2,
+            "maxLength": 10,
+            "default": "auto",
+        },
+        "response_format": {"type": "string", "enum": ["wav"], "default": "wav"},
+    }
+
+    success = operation["responses"]["200"]
+    assert success["content"] == {
+        "audio/wav": {"schema": {"type": "string", "format": "binary"}}
+    }
+    assert "application/json" not in success["content"]
+    assert set(success["headers"]) == {
+        "X-Request-ID",
+        "X-TTS-Model",
+        "X-Audio-Duration",
+        "X-Queue-Ms",
+        "X-Processing-Ms",
+    }
+    for header in success["headers"].values():
+        header_schema = header["schema"]
+        assert header_schema["type"] == "string"
+        assert 0 < header_schema["minLength"] <= header_schema["maxLength"] <= 84
+
+    error_ref = {"$ref": "#/components/schemas/ErrorEnvelope"}
+    for status_code in ("401", "413", "422", "500"):
+        assert operation["responses"][status_code]["content"] == {
+            "application/json": {"schema": error_ref}
+        }
+
+    components = schema["components"]["schemas"]
+    assert components["ErrorEnvelope"]["properties"]["error"] == {
+        "$ref": "#/components/schemas/ErrorBody"
+    }
+    assert "details" not in components["ErrorBody"]["required"]
+    details_schema = components["ErrorBody"]["properties"]["details"]
+    assert {"type": "null"} in details_schema["anyOf"]
+    assert {
+        "type": "array",
+        "items": {"$ref": "#/components/schemas/ValidationDetail"},
+    } in details_schema["anyOf"]
+    assert components["ValidationDetail"]["properties"]["reason"]["enum"] == [
+        "required",
+        "invalid",
+        "duplicate",
+        "unknown",
+    ]
+
+    route = next(
+        route
+        for route in app.routes
+        if getattr(route, "path", None) == "/v1/audio/speech/clone"
+    )
+    assert route.dependant.body_params == []
+
+
 class _SynthesizeOnlyRouter:
     async def synthesize(self, _request: object, _request_id: str) -> AudioResult:
         return AudioResult(

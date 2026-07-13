@@ -35,6 +35,10 @@ from tts_playground.gateway.backends import (
     ProxyResult,
 )
 from tts_playground.gateway.metrics import GatewayMetrics
+from tts_playground.gateway.openapi import (
+    EPHEMERAL_CLONE_OPENAPI_EXTRA,
+    EPHEMERAL_CLONE_RESPONSES,
+)
 from tts_playground.gateway.routes import create_management_router
 from tts_playground.gateway.schemas import SpeechRequest
 
@@ -229,7 +233,12 @@ def create_gateway_app(
             operation=synthesize,
         )
 
-    @app.post("/v1/audio/speech/clone")
+    @app.post(
+        "/v1/audio/speech/clone",
+        response_class=Response,
+        responses=EPHEMERAL_CLONE_RESPONSES,
+        openapi_extra=EPHEMERAL_CLONE_OPENAPI_EXTRA,
+    )
     async def ephemeral_clone(
         request: Request,
         _authenticated: Annotated[None, Depends(authenticate)],
