@@ -19,8 +19,10 @@ with warnings.catch_warnings():
     warnings.simplefilter("ignore", StarletteDeprecationWarning)
     from starlette.testclient import TestClient
 
+from tts_playground.common.errors import ServiceError
 from tts_playground.common.models import ModelID
 from tts_playground.common.settings import QwenSettings
+from tts_playground.common.validation import ValidationIssue
 from tts_playground.qwen.adapter import InternalSpeechRequest, SynthesisResult
 from tts_playground.qwen.app import create_qwen_app
 
@@ -738,6 +740,35 @@ def test_non_clone_validation_error_has_no_details(tmp_path: Path) -> None:
         "error": {
             "code": "validation_error",
             "message": "Request validation failed.",
+            "request_id": request_id,
+        }
+    }
+
+
+def test_non_validation_service_error_omits_typed_details(tmp_path: Path) -> None:
+    app = create_qwen_app(_settings(tmp_path), FakeAdapter())
+    request_id = "req_non-validation-details"
+
+    async def raise_non_validation_error() -> None:
+        raise ServiceError(
+            status_code=422,
+            code="clone_rejected",
+            message="Clone request was rejected.",
+            details=(ValidationIssue("audio", "invalid"),),
+        )
+
+    app.add_api_route("/test/non-validation-details", raise_non_validation_error)
+    with TestClient(app) as client:
+        response = client.get(
+            "/test/non-validation-details",
+            headers={"X-Request-ID": request_id},
+        )
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "error": {
+            "code": "clone_rejected",
+            "message": "Clone request was rejected.",
             "request_id": request_id,
         }
     }

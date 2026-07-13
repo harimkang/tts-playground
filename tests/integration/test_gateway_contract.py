@@ -101,11 +101,21 @@ def test_ephemeral_clone_openapi_is_exact_and_documentation_only(tmp_path: Path)
     }
     assert "details" not in components["ErrorBody"]["required"]
     details_schema = components["ErrorBody"]["properties"]["details"]
-    assert {"type": "null"} in details_schema["anyOf"]
-    assert {
+    assert details_schema == {
         "type": "array",
         "items": {"$ref": "#/components/schemas/ValidationDetail"},
-    } in details_schema["anyOf"]
+        "minItems": 1,
+        "maxItems": 16,
+        "title": "Details",
+    }
+    field_schema = components["ValidationDetail"]["properties"]["field"]
+    assert field_schema == {
+        "type": "string",
+        "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,63}$",
+        "minLength": 1,
+        "maxLength": 64,
+        "title": "Field",
+    }
     assert components["ValidationDetail"]["properties"]["reason"]["enum"] == [
         "required",
         "invalid",

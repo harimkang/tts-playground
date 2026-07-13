@@ -524,7 +524,7 @@ def _error_response(
         "message": message,
         "request_id": request_id,
     }
-    if details is not None:
+    if code == "validation_error" and details is not None:
         error_content["details"] = validation_issues_to_public(details)
     return JSONResponse(
         status_code=status_code,

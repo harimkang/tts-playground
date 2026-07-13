@@ -1,12 +1,17 @@
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic.json_schema import SkipJsonSchema
 
 from tts_playground.common.models import QWEN_CUSTOM_SPEAKERS, ModelID
 
 
 class ValidationDetail(BaseModel):
-    field: str
+    field: str = Field(
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z_][A-Za-z0-9_]{0,63}$",
+    )
     reason: Literal["required", "invalid", "duplicate", "unknown"]
 
 
@@ -14,7 +19,10 @@ class ErrorBody(BaseModel):
     code: str
     message: str
     request_id: str
-    details: list[ValidationDetail] | None = None
+    details: (
+        Annotated[list[ValidationDetail], Field(min_length=1, max_length=16)]
+        | SkipJsonSchema[None]
+    ) = Field(default_factory=lambda: None)
 
 
 class ErrorEnvelope(BaseModel):
