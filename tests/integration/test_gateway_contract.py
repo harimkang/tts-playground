@@ -77,6 +77,16 @@ class _ValidationDetailRouter:
         )
 
 
+class _NonValidationDetailRouter:
+    async def synthesize(self, _request: object, _request_id: str) -> AudioResult:
+        raise ServiceError(
+            status_code=422,
+            code="clone_rejected",
+            message="Backend request failed.",
+            details=(ValidationIssue("voice", "invalid"),),
+        )
+
+
 def test_health_is_public_and_speech_requires_auth(tmp_path: Path) -> None:
     key = tmp_path / "key"
     key.write_text("secret-key\n")
@@ -526,6 +536,31 @@ def test_service_validation_details_use_public_envelope(tmp_path: Path) -> None:
             "message": "Request validation failed.",
             "request_id": request_id,
             "details": [{"field": "voice", "reason": "invalid"}],
+        }
+    }
+
+
+def test_service_non_validation_details_are_omitted(tmp_path: Path) -> None:
+    key = tmp_path / "key"
+    key.write_text("secret-key\n")
+    client = _create_client(key, _NonValidationDetailRouter())
+    request_id = "req_service-non-validation"
+
+    response = client.post(
+        "/v1/audio/speech",
+        headers={
+            "Authorization": "Bearer secret-key",
+            "X-Request-ID": request_id,
+        },
+        json=_speech_body(),
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "error": {
+            "code": "clone_rejected",
+            "message": "Backend request failed.",
+            "request_id": request_id,
         }
     }
 

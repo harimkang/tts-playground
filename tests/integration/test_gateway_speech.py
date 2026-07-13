@@ -559,7 +559,7 @@ async def test_worker_validation_details_are_forwarded_with_public_request_id(
         files={"audio": ("reference.wav", b"audio", "audio/wav")},
     )
     metrics = await app_client.get("/metrics", headers=_authorization())
-    logs = capsys.readouterr().out
+    captured = capsys.readouterr()
 
     assert response.status_code == 422
     assert response.json()["error"] == {
@@ -568,12 +568,19 @@ async def test_worker_validation_details_are_forwarded_with_public_request_id(
         "request_id": "req_public-validation",
         "details": [{"field": safe_detail_marker, "reason": "unknown"}],
     }
-    assert private_message not in response.text
-    assert private_request_id not in response.text
-    assert private_value not in response.text
-    assert private_context not in response.text
+    private_markers = (
+        private_message,
+        private_request_id,
+        private_value,
+        private_context,
+    )
+    public_output = response.text + metrics.text + captured.out + captured.err
+    assert all(marker not in public_output for marker in private_markers)
+    assert safe_detail_marker in response.text
+    assert '"reason":"unknown"' in response.text
     assert safe_detail_marker not in metrics.text
-    assert safe_detail_marker not in logs
+    assert safe_detail_marker not in captured.out
+    assert safe_detail_marker not in captured.err
 
 
 @respx.mock
