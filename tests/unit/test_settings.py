@@ -24,3 +24,4 @@ def test_settings_defaults_match_design() -> None:
     assert qwen.idle_unload_seconds == 600.0
     assert qwen.min_free_vram_bytes == 10 * 1024**3
     assert qwen.error_cooldown_seconds == 30.0
+    assert qwen.device == "cuda:0"

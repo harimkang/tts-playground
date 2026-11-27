@@ -581,4 +581,5 @@ def _scope_header(scope: Scope, name: bytes) -> str | None:
     return None
 
 
-app = create_qwen_app(QwenSettings(), QwenTTSAdapter())
+_settings = QwenSettings()
+app = create_qwen_app(_settings, QwenTTSAdapter(device=_settings.device))

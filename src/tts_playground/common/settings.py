@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import Literal
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -25,3 +26,5 @@ class QwenSettings(BaseSettings):
     min_free_vram_bytes: int = Field(default=10 * 1024**3)
     error_cooldown_seconds: float = 30.0
     attention_implementation: str = "sdpa"
+    #: "cuda:0" on the GPU host; "cpu" on the standby host (see QwenTTSAdapter).
+    device: Literal["cuda:0", "cpu"] = "cuda:0"
