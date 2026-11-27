@@ -39,6 +39,7 @@ class FakeTorch:
     def __init__(self) -> None:
         self.cuda = FakeCuda()
         self.bfloat16 = object()
+        self.float32 = object()
 
 
 def _request(
@@ -242,3 +243,38 @@ def test_load_cuda_oom_is_converted(adapter: QwenTTSAdapter, model_class: Mock) 
 
     with pytest.raises(CudaOutOfMemory):
         adapter.load("Qwen/repository", "sdpa")
+
+
+def test_cpu_device_loads_float32_on_cpu(torch_module: FakeTorch, model_class: Mock) -> None:
+    adapter = QwenTTSAdapter(torch_module=torch_module, model_class=model_class, device="cpu")
+
+    adapter.load("Qwen/repository", "sdpa")
+
+    model_class.from_pretrained.assert_called_once_with(
+        "Qwen/repository",
+        device_map="cpu",
+        dtype=torch_module.float32,
+        attn_implementation="sdpa",
+    )
+
+
+def test_cpu_device_never_blocks_on_vram(torch_module: FakeTorch) -> None:
+    torch_module.cuda.mem_get_info_result = (0, 0)
+    adapter = QwenTTSAdapter(torch_module=torch_module, device="cpu")
+
+    assert adapter.free_vram_bytes() >= 10 * 1024**3
+
+
+def test_cpu_device_cleanup_skips_cuda(
+    torch_module: FakeTorch,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    collect = Mock()
+    monkeypatch.setattr("tts_playground.qwen.real_adapter.gc.collect", collect)
+    adapter = QwenTTSAdapter(torch_module=torch_module, device="cpu")
+
+    adapter.cleanup_device_memory()
+
+    collect.assert_called_once_with()
+    assert torch_module.cuda.empty_cache_calls == 0
+    assert torch_module.cuda.ipc_collect_calls == 0

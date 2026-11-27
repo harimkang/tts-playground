@@ -3,9 +3,10 @@ from __future__ import annotations
 import gc
 import importlib
 import io
+import sys
 from collections.abc import Callable, Sized
 from pathlib import Path
-from typing import Protocol, cast
+from typing import Literal, Protocol, cast
 
 import soundfile as sf  # type: ignore[import-untyped]
 
@@ -30,6 +31,7 @@ class _CudaModule(Protocol):
 class _TorchModule(Protocol):
     cuda: _CudaModule
     bfloat16: object
+    float32: object
 
 
 class _ModelClass(Protocol):
@@ -78,19 +80,37 @@ class _QwenModel(Protocol):
     ) -> tuple[list[object], int]: ...
 
 
+QwenDevice = Literal["cuda:0", "cpu"]
+
+
 class QwenTTSAdapter:
-    """Lazy adapter around the optional qwen-tts and torch packages."""
+    """Lazy adapter around the optional qwen-tts and torch packages.
+
+    ``device="cpu"`` exists for the standby host without an NVIDIA GPU. Apple MPS is
+    deliberately not offered: on torch 2.11 it produced truncated or garbled speech for
+    sentences longer than a few words (bf16, fp32 and eager attention all failed in
+    side-by-side ASR checks), while CPU float32 matched the CUDA output.
+    """
 
     def __init__(
         self,
         *,
         torch_module: _TorchModule | None = None,
         model_class: _ModelClass | None = None,
+        device: QwenDevice = "cuda:0",
     ) -> None:
         self._torch_module = torch_module
         self._model_class = model_class
+        self._device = device
+
+    @property
+    def _on_cuda(self) -> bool:
+        return self._device.startswith("cuda")
 
     def free_vram_bytes(self) -> int:
+        if not self._on_cuda:
+            # No device memory to budget on CPU; the VRAM gate must never block a load.
+            return sys.maxsize
         torch_module = self._torch()
         free_bytes, _total_bytes = self._with_oom_conversion(
             torch_module.cuda.mem_get_info
@@ -103,14 +123,17 @@ class QwenTTSAdapter:
         return self._with_oom_conversion(
             model_class.from_pretrained,
             repository,
-            device_map="cuda:0",
-            dtype=torch_module.bfloat16,
+            device_map=self._device,
+            # bf16 matmuls on CPU are slow and lossy; float32 is the CPU baseline.
+            dtype=torch_module.bfloat16 if self._on_cuda else torch_module.float32,
             attn_implementation=attention_implementation,
         )
 
     def cleanup_device_memory(self) -> None:
-        torch_module = self._torch()
         gc.collect()
+        if not self._on_cuda:
+            return
+        torch_module = self._torch()
         self._with_oom_conversion(torch_module.cuda.empty_cache)
         self._with_oom_conversion(torch_module.cuda.ipc_collect)
 

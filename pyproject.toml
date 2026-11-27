@@ -42,8 +42,10 @@ url = "https://download.pytorch.org/whl/cu128"
 explicit = true
 
 [tool.uv.sources]
-torch = { index = "pytorch-cu128" }
-torchaudio = { index = "pytorch-cu128" }
+# CUDA wheels only exist for Linux; macOS (Apple Silicon standby host) takes the PyPI
+# build, which ships the MPS backend.
+torch = { index = "pytorch-cu128", marker = "sys_platform == 'linux'" }
+torchaudio = { index = "pytorch-cu128", marker = "sys_platform == 'linux'" }
 
 [build-system]
 requires = ["hatchling==1.31.0"]
